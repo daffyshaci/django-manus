@@ -148,9 +148,9 @@ class ToolCallAgent(ReActAgent):
 
             # Default path: assistant decides to use tools
             # If any selected tool is a special tool (e.g., terminate), do NOT persist the assistant content or tool_calls
-            if any(self._is_special_tool(call.function.name) for call in self.tool_calls):
-                # Skip persisting assistant message to avoid awkward history entries for terminate
-                return bool(self.tool_calls)
+            # if any(self._is_special_tool(call.function.name) for call in self.tool_calls):
+            #     # Skip persisting assistant message to avoid awkward history entries for terminate
+            #     return bool(self.tool_calls)
             # Otherwise, record assistant's content and tool calls in memory
             self.update_memory("assistant", content, tool_calls=self.tool_calls)
             return bool(self.tool_calls)
@@ -201,18 +201,18 @@ class ToolCallAgent(ReActAgent):
 
             # Add tool response to memory via update_memory (persists through hook),
             # except for special tools like 'terminate' where we intentionally skip persistence
-            if not self._is_special_tool(command.function.name):
-                self.update_memory(
-                    role="tool",
-                    content=result,
-                    tool_call_id=command.id,
-                    name=command.function.name,
-                    base64_image=self._current_base64_image,
-                )
-                results.append(result)
-            else:
-                # For terminate, we skip saving the tool message to keep history clean
-                logger.info("Skipping persistence for special tool result: %s", command.function.name)
+            # if not self._is_special_tool(command.function.name):
+            self.update_memory(
+                role="tool",
+                content=result,
+                tool_call_id=command.id,
+                name=command.function.name,
+                base64_image=self._current_base64_image,
+            )
+            results.append(result)
+            # else:
+            #     # For terminate, we skip saving the tool message to keep history clean
+            #     logger.info("Skipping persistence for special tool result: %s", command.function.name)
 
         return "\n\n".join(results)
 

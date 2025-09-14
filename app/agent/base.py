@@ -220,10 +220,10 @@ class BaseAgent(BaseModel, ABC):
                     )
 
                 # Upsert Memory for this conversation and append message JSON
-                async def _get_or_create_memory():
-                    return MemoryDB.objects.get_or_create(conversation=conv, defaults={"messages": []})
+                # async def _get_or_create_memory():
+                #     return MemoryDB.objects.get_or_create(conversation=conv, defaults={"messages": []})
 
-                memory, _ = await sync_to_async(_get_or_create_memory)()
+                memory, _ = await sync_to_async(MemoryDB.objects.get_or_create)(conversation=conv, defaults={"messages": []})
                 await sync_to_async(memory.add_message)(msg_obj)
 
                 # Emit WS event so frontend can append live without reload
