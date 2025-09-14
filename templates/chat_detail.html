@@ -1,0 +1,260 @@
+{% extends 'base.html' %} {% block content %}
+<div class="card pad" id="chatCard">
+  <div class="row" style="align-items: center; gap: 8px">
+    <div class="pill" id="status">Terhubung</div>
+    <div class="muted" id="modelInfo"></div>
+    <div class="grow"></div>
+    <button
+      class="btn"
+      id="btnClear"
+      title="Bersihkan tampilan (tidak hapus di DB)"
+    >
+      Bersihkan
+    </button>
+  </div>
+  <div class="divider"></div>
+  <div
+    id="chatLog"
+    class="shadow-inset"
+    style="
+      height: 55vh;
+      overflow: auto;
+      padding: 12px;
+      border-radius: 12px;
+      background: #0a0f1a;
+      border: 1px solid #1f2937;
+    "
+  >
+    <div class="muted">Memuat percakapan...</div>
+  </div>
+  <div id="thinking" class="muted" style="display: none; margin-top: 8px">
+    🤔 Agent sedang berpikir...
+  </div>
+  <div class="divider"></div>
+  <div class="row">
+    <input id="msg" class="input grow" placeholder="Tulis pesan..." />
+    <button id="send" class="btn primary">Kirim</button>
+  </div>
+</div>
+{% endblock %} {% block scripts %}
+<script>
+  const conversationId = "{{ conversation_id }}";
+  const chatLog = document.getElementById("chatLog");
+  const sendBtn = document.getElementById("send");
+  const msgInput = document.getElementById("msg");
+  const statusEl = document.getElementById("status");
+  const thinkingEl = document.getElementById("thinking");
+  const modelInfo = document.getElementById("modelInfo");
+  const btnClear = document.getElementById("btnClear");
+
+  const roleLabel = {
+    user: "Anda",
+    assistant: "Manus",
+    system: "System",
+    tool: "Tool",
+  };
+
+  // Indikator typing/streaming sederhana: tampilkan saat ada event thoughts/step dan sembunyikan saat finished
+  function setThinking(thinking) {
+    thinkingEl.style.display = thinking ? "block" : "none";
+  }
+
+  function appendMessage({ role, content, base64_image }) {
+    const wrap = document.createElement("div");
+    wrap.className = "card pad";
+    wrap.style.margin = "8px 0";
+    const who = roleLabel[role] || role;
+    const header = `<div style="display:flex; gap:8px; align-items:center;"><span class="pill">${who}</span></div>`;
+    let bodyHtml = "";
+    if (content) {
+      // Render markdown
+      bodyHtml += `<div style="white-space:pre-wrap; line-height:1.5;">${renderMarkdownToHtml(
+        content
+      )}</div>`;
+    }
+    if (base64_image) {
+      bodyHtml += `<div style="margin-top:8px"><img style="max-width:100%" src="data:image/png;base64,${base64_image}"/></div>`;
+    }
+    wrap.innerHTML = header + bodyHtml;
+    chatLog.appendChild(wrap);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function appendInfo(text) {
+    const div = document.createElement("div");
+    div.className = "muted";
+    div.style.fontSize = "12px";
+    div.style.margin = "6px 0";
+    div.textContent = text;
+    chatLog.appendChild(div);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function setSendingState(sending) {
+    sendBtn.disabled = sending;
+    msgInput.disabled = sending;
+    // Saat mengirim pesan user, kita boleh tampilkan indikator singkat
+    thinkingEl.style.display = sending ? "block" : "none";
+  }
+
+  async function loadConversation() {
+    const res = await fetch(`/api/v1/chat/conversations/${conversationId}`, {
+      credentials: "include",
+    });
+    if (!res.ok) {
+      chatLog.innerHTML = '<div class="muted">Gagal memuat percakapan</div>';
+      return;
+    }
+    const data = await res.json();
+    chatLog.innerHTML = "";
+    modelInfo.textContent = `Model: ${data.conversation.llm_model}`;
+    for (const m of data.messages) {
+      appendMessage(m);
+    }
+    if (data.first_initiate) {
+      // Panggil trigger agar Celery mulai memproses pesan pertama
+      try {
+        await fetch(
+          `/api/v1/chat/conversations/${conversationId}/trigger-first-message`,
+          {
+            method: "POST",
+            headers: { "X-CSRFToken": getCookie("csrftoken") },
+            credentials: "include",
+          }
+        );
+        appendInfo("Memproses pesan awal...");
+      } catch (e) {
+        console.warn("trigger-first-message gagal", e);
+      }
+    }
+  }
+
+  async function sendMessage() {
+    const text = msgInput.value.trim();
+    if (!text) return;
+    setSendingState(true);
+    try {
+      // Optimistic append user message (akan tersimpan via API juga)
+      appendMessage({ role: "user", content: text });
+      msgInput.value = "";
+      const res = await fetch(
+        `/api/v1/chat/conversations/${conversationId}/messages`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": getCookie("csrftoken"),
+          },
+          credentials: "include",
+          body: JSON.stringify({ content: text }),
+        }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Gagal" }));
+        throw new Error(err.detail || err.error || "Gagal mengirim pesan");
+      }
+      appendInfo("Pesan dikirim. Menunggu respons agent...");
+    } catch (e) {
+      showToast(e.message);
+    } finally {
+      setSendingState(false);
+    }
+  }
+
+  sendBtn.addEventListener("click", sendMessage);
+  msgInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+  btnClear.addEventListener("click", () => {
+    chatLog.innerHTML = "";
+  });
+
+  // WebSocket untuk notifikasi real-time
+  let ws;
+  function connectWS() {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(
+      `${scheme}://${location.host}/ws/conversations/${conversationId}/`
+    );
+    ws.onopen = () => {
+      statusEl.textContent = "Terhubung";
+      statusEl.style.background = "rgba(16,185,129,0.2)";
+      statusEl.style.border = "1px solid rgba(16,185,129,0.4)";
+    };
+    ws.onclose = () => {
+      statusEl.textContent = "Terputus";
+      statusEl.style.background = "rgba(239,68,68,0.2)";
+      statusEl.style.border = "1px solid rgba(239,68,68,0.4)";
+      setTimeout(connectWS, 2000);
+    };
+    ws.onerror = () => {
+      showToast("WS error");
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type !== "notify") return;
+        handleNotify(data.event, data.payload || {});
+      } catch (e) {
+        console.warn("Invalid WS data", e);
+      }
+    };
+  }
+
+  function handleNotify(event, payload) {
+    switch (event) {
+      case "agent.step":
+        appendInfo(`Langkah ${payload.step}/${payload.max_steps}`);
+        setThinking(true);
+        break;
+      case "agent.thoughts":
+        if (payload.content) appendInfo(`Pemikiran: ${payload.content}`);
+        setThinking(true);
+        break;
+      case "agent.tools_selected":
+        appendInfo(`Tools dipilih: ${payload.count}`);
+        break;
+      case "agent.tools_prepared":
+        appendInfo(`Menyiapkan tools: ${(payload.tools || []).join(", ")}`);
+        break;
+      case "agent.tool_args":
+        appendInfo(`Argumen tool: ${payload.arguments}`);
+        break;
+      case "agent.tool_error":
+      case "agent.error":
+        showToast(payload.error || payload.detail || "Terjadi kesalahan");
+        appendInfo(`Error: ${payload.error || payload.detail}`);
+        break;
+      case "agent.no_tool":
+        appendInfo(
+          "Tidak ada tool dipanggil. Memeriksa apakah jawaban sudah final..."
+        );
+        break;
+      case "agent.finished":
+        appendInfo("Selesai.");
+        setThinking(false);
+        break;
+      case "agent.cleanup_start":
+        appendInfo("Membersihkan resource...");
+        break;
+      case "agent.cleanup_done":
+        appendInfo("Cleanup selesai.");
+        break;
+      case "message.created":
+        if (payload && payload.message) {
+          appendMessage(payload.message);
+        }
+        break;
+      default:
+        // Selain notify, pesan baru akan disimpan via ORM hook dan bisa dimuat via reload; namun kita bisa juga menampilkan live jika backend mengirim event khusus.
+        break;
+    }
+  }
+
+  loadConversation();
+  connectWS();
+</script>
+{% endblock %}

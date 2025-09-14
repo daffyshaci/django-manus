@@ -1,0 +1,28 @@
+from config.env import env, BASE_DIR
+
+
+TEMP = str(BASE_DIR / 'media/temp')
+# # Linode settings
+LINODE_BUCKET = env('AWS_STORAGE_BUCKET_NAME')
+LINODE_BUCKET_REGION = env('AWS_REGION')
+LINODE_BUCKET_ACCESS_KEY = env('AWS_ACCESS_KEY_ID')
+LINODE_BUCKET_SECRET_KEY = env('AWS_SECRET_ACCESS_KEY')
+
+# Linode Static Settings
+AWS_S3_ENDPOINT_URL = f'https://kontenai.sgp1.digitaloceanspaces.com'
+AWS_ACCESS_KEY_ID = LINODE_BUCKET_ACCESS_KEY
+AWS_SECRET_ACCESS_KEY = LINODE_BUCKET_SECRET_KEY
+AWS_STORAGE_BUCKET_NAME = LINODE_BUCKET
+AWS_S3_REGION_NAME = LINODE_BUCKET_REGION
+AWS_S3_USE_SSL = True
+AWS_S3_OBJECT_PARAMETERS = {
+    'CacheControl': 'max-age=86400',
+}
+
+AWS_DEFAULT_ACL = 'public-read'
+AWS_QUERYSTRING_AUTH = False
+PUBLIC_MEDIA_LOCATION = 'media'
+AWS_LOCATION = 'media'
+# MEDIA_URL = f'https://kontenai.sgp1.digitaloceanspaces.com/{PUBLIC_MEDIA_LOCATION}/'
+MEDIA_URL = f'https://{AWS_STORAGE_BUCKET_NAME}.{AWS_S3_REGION_NAME}.digitaloceanspaces.com/{AWS_LOCATION}/'
+DEFAULT_FILE_STORAGE = 'app.storage_backends.PublicMediaStorage'
