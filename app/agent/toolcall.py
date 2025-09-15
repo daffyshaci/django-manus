@@ -146,12 +146,6 @@ class ToolCallAgent(ReActAgent):
                 # Continue only if there are tools selected
                 return bool(content)
 
-            # Default path: assistant decides to use tools
-            # If any selected tool is a special tool (e.g., terminate), do NOT persist the assistant content or tool_calls
-            # if any(self._is_special_tool(call.function.name) for call in self.tool_calls):
-            #     # Skip persisting assistant message to avoid awkward history entries for terminate
-            #     return bool(self.tool_calls)
-            # Otherwise, record assistant's content and tool calls in memory
             self.update_memory("assistant", content, tool_calls=self.tool_calls)
             return bool(self.tool_calls)
         except Exception as e:
@@ -162,7 +156,7 @@ class ToolCallAgent(ReActAgent):
                     "agent.error",
                     {"type": "think_error", "detail": str(e)},
                 )
-            self.update_memory("assistant", f"Error encountered while processing: {str(e)}")
+            self.update_memory("assistant", f"Error encountered while processing user request. please try again.")
             return False
 
     async def act(self) -> str:

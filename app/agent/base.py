@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import List, Optional, Callable
+import asyncio
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -57,6 +58,9 @@ class BaseAgent(BaseModel, ABC):
             "Signature: (agent, role, content, base64_image, extra_kwargs)"
         ),
     )
+
+    # Track pending async persistence tasks to ensure they complete before run() returns
+    pending_persist_tasks: List[asyncio.Task] = Field(default_factory=list, exclude=True)  # type: ignore
 
     class Config:
         arbitrary_types_allowed = True
@@ -167,8 +171,14 @@ class BaseAgent(BaseModel, ABC):
                 result = self.persist_message_hook(self, role, content, base64_image, kwargs)
                 # Support coroutine hooks transparently
                 if hasattr(result, "__await__"):
-                    import asyncio
-                    asyncio.create_task(result)  # fire-and-forget, no blocking
+                    # Schedule and track the task so we can await it before run() returns
+                    try:
+                        loop = asyncio.get_running_loop()
+                        task = loop.create_task(result)  # type: ignore[arg-type]
+                        self.pending_persist_tasks.append(task)
+                    except RuntimeError:
+                        # No running loop; run synchronously as a fallback
+                        asyncio.run(result)  # type: ignore[arg-type]
             except Exception as e:
                 logger.error(f"Error in persist_message_hook: {e}")
 
@@ -291,6 +301,14 @@ class BaseAgent(BaseModel, ABC):
                 self.current_step = 0
                 self.state = AgentState.IDLE
                 results.append(f"Terminated: Reached max steps ({self.max_steps})")
+        # Ensure all pending persistence operations complete before cleanup/return
+        if self.pending_persist_tasks:
+            pending = [t for t in self.pending_persist_tasks if not t.done()]
+            if pending:
+                try:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                finally:
+                    self.pending_persist_tasks.clear()
         await SANDBOX_CLIENT.cleanup()
         return "\n".join(results) if results else "No steps executed"
 

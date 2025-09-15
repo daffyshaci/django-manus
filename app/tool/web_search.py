@@ -18,6 +18,8 @@ from app.tool.search import (
     YahooSearchEngine,
 )
 from app.tool.search.base import SearchItem
+from app.llm import LLM
+from app.prompt.extract_content import EXTRACT_CONTENT_SYSTEM_PROMPT
 
 
 class SearchResult(BaseModel):
@@ -61,46 +63,37 @@ class SearchResponse(ToolResult):
     metadata: Optional[SearchMetadata] = Field(
         default=None, description="Metadata about the search"
     )
+    extracted_content: Optional[str] = Field(
+        default=None, description="Content extracted by LLM based on the goal"
+    )
+    snippet: Optional[str] = Field(
+        default=None,
+        description="Raw content snippet from first fetched result when no goal provided",
+    )
 
     @model_validator(mode="after")
     def populate_output(self) -> "SearchResponse":
-        """Populate output or error fields based on search results."""
+        """Populate output as structured dict to match desired schema."""
         if self.error:
             return self
 
-        result_text = [f"Search results for '{self.query}':"]
+        # Build the output object according to the requested shape
+        search_result = [
+            {
+                "position": r.position,
+                "title": (r.title or "").strip(),
+                "url": r.url,
+                "description": (r.description or "").strip(),
+            }
+            for r in self.results
+        ]
 
-        for i, result in enumerate(self.results, 1):
-            # Add title with position number
-            title = result.title.strip() or "No title"
-            result_text.append(f"\n{i}. {title}")
-
-            # Add URL with proper indentation
-            result_text.append(f"   URL: {result.url}")
-
-            # Add description if available
-            if result.description.strip():
-                result_text.append(f"   Description: {result.description}")
-
-            # Add content preview if available
-            if result.raw_content:
-                content_preview = result.raw_content[:10000].replace("\n", " ").strip()
-                if len(result.raw_content) > 10000:
-                    content_preview += "..."
-                result_text.append(f"   Content: {content_preview}")
-
-        # Add metadata at the bottom if available
-        if self.metadata:
-            result_text.extend(
-                [
-                    f"\nMetadata:",
-                    f"- Total results: {self.metadata.total_results}",
-                    f"- Language: {self.metadata.language}",
-                    f"- Country: {self.metadata.country}",
-                ]
-            )
-
-        self.output = "\n".join(result_text)
+        self.output = {
+            "search_result": search_result,
+            "extracted_content": self.extracted_content or "",
+        }
+        if self.snippet and self.snippet.strip():
+            self.output["snippet"] = self.snippet
         return self
 
 
@@ -165,7 +158,7 @@ class WebContentFetcher:
                 next_element = heading.find_next_sibling()
 
                 while next_element and next_element.name not in heading_tags:
-                    if next_element.name in ['p', 'ul', 'ol']:
+                    if next_element.name in ['p', 'ul', 'ol', 'pre', 'code']:
                         text_content = next_element.get_text(separator='\n\n', strip=True)
                         if text_content:
                             content.append(text_content)
@@ -225,11 +218,15 @@ class WebSearch(BaseTool):
                 "description": "(optional) Country code for search results (default: us).",
                 "default": "us",
             },
-            "fetch_content": {
+            "extract_content": {
                 "type": "boolean",
-                "description": "(optional) Whether to fetch full content from result pages. Default is false.",
-                "default": False,
+                "description": "Whether to extract content from result pages (sequential with early-stop when goal present). Default is true.",
+                "default": True,
             },
+            "goal":{
+                "type": "string",
+                "description": "Extraction goal for 'extract_content'",
+            }
         },
         "required": ["query"],
     }
@@ -241,6 +238,7 @@ class WebSearch(BaseTool):
         "bing": BingSearchEngine(),
     }
     content_fetcher: WebContentFetcher = WebContentFetcher()
+    llm: Optional[LLM] = Field(default_factory=LLM, exclude=True)
 
     async def execute(
         self,
@@ -248,7 +246,10 @@ class WebSearch(BaseTool):
         num_results: int = 3,
         lang: Optional[str] = None,
         country: Optional[str] = None,
-        fetch_content: bool = True,
+        # Backward-compatible flags: prefer extract_content if provided
+        extract_content: Optional[bool] = None,
+        goal: Optional[str] = None,
+        fetch_content: Optional[bool] = None,
     ) -> SearchResponse:
         """
         Execute a Web search and return detailed search results.
@@ -258,14 +259,22 @@ class WebSearch(BaseTool):
             num_results: The number of search results to return (default: 3, max: 3)
             lang: Language code for search results (default from config)
             country: Country code for search results (default from config)
-            fetch_content: Whether to fetch content from result pages (default: False)
+            extract_content: Whether to extract content from result pages
+            goal: Goal text to guide LLM extraction
+            fetch_content: Deprecated; maintained for compatibility. Use extract_content instead.
 
         Returns:
             A structured response containing search results and metadata
         """
+        # Determine effective extract flag
+        if extract_content is None and fetch_content is None:
+            effective_extract = True
+        else:
+            effective_extract = extract_content if extract_content is not None else bool(fetch_content)
+
         # Limit num_results to maximum of 3
         num_results = min(num_results, 3)
-        
+
         # Get settings from config
         retry_delay = (
             getattr(config.search_config, "retry_delay", 60)
@@ -294,15 +303,50 @@ class WebSearch(BaseTool):
             )
 
         search_params = {"lang": lang, "country": country}
+        # Initialize snippet holder (only used when goal is None)
+        snippet: Optional[str] = None
 
         # Try searching with retries when all engines fail
         for retry_count in range(max_retries + 1):
             results = await self._try_all_engines(query, num_results, search_params)
 
             if results:
-                # Fetch content if requested
-                if fetch_content:
-                    results = await self._fetch_content_for_results(results)
+                extracted_text: Optional[str] = None
+
+                # Goal-driven sequential fetch with early stop
+                if effective_extract and goal:
+                    for i, result in enumerate(results):
+                        content = await self.content_fetcher.fetch_content(result.url)
+                        if content:
+                            # Keep raw content for the matched result
+                            results[i].raw_content = content
+                            # Use LLM to extract according to goal
+                            try:
+                                extracted_text = await self._extract_with_llm(
+                                    page_content=content, goal=goal, url=result.url
+                                )
+                            except Exception as e:
+                                logger.warning(f"LLM extraction failed for {result.url}: {e}")
+                                extracted_text = None
+
+                            # Early stop: break immediately after first successful fetch
+                            break
+                        # If no content, try next result
+                    # end for
+                elif effective_extract and not goal:
+                    # Sequential fetch with early stop at first content found (no LLM)
+                    for i, result in enumerate(results):
+                        content = await self.content_fetcher.fetch_content(result.url)
+                        if content:
+                            results[i].raw_content = content
+                            # build snippet from normalized whitespace
+                            try:
+                                normalized = " ".join(content.split())
+                                snippet = (normalized[:800]).strip() if normalized else None
+                            except Exception:
+                                snippet = None
+                            break
+                # else: do not fetch content
 
                 # Return a successful structured response
                 return SearchResponse(
@@ -314,6 +358,8 @@ class WebSearch(BaseTool):
                         language=lang,
                         country=country,
                     ),
+                    extracted_content=extracted_text if goal else None,
+                    snippet=snippet,
                 )
 
             if retry_count < max_retries:
@@ -455,12 +501,71 @@ class WebSearch(BaseTool):
             ),
         )
 
+    async def _extract_with_llm(self, page_content: str, goal: str, url: Optional[str] = None) -> Optional[str]:
+        """Use LLM to extract content from page_content based on the goal."""
+        try:
+            system_msg = {"role": "system", "content": EXTRACT_CONTENT_SYSTEM_PROMPT}
+            user_msg = {
+                "role": "user",
+                "content": (
+                    f"Goal:\n{goal}\n\n"
+                    f"URL:\n{url or ''}\n\n"
+                    f"Page Content (truncated to 10k chars):\n{page_content}"
+                ),
+            }
+
+            # Define a simple tool schema to force JSON extraction
+            extraction_tool = {
+                "type": "function",
+                "function": {
+                    "name": "return_extracted_content",
+                    "description": "Return the extracted content as a single string.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "extracted_content": {
+                                "type": "string",
+                                "description": "The content extracted from the page according to the goal",
+                            }
+                        },
+                        "required": ["extracted_content"],
+                    },
+                },
+            }
+
+            response = await self.llm.ask_tool(
+                messages=[user_msg],
+                system_msgs=[system_msg],
+                tools=[extraction_tool],
+                tool_choice="required",
+                temperature=0.2,
+                timeout=180,
+            )
+
+            if response and getattr(response, "tool_calls", None):
+                try:
+                    import json
+
+                    args = json.loads(response.tool_calls[0].function.arguments)
+                    extracted = args.get("extracted_content")
+                    if isinstance(extracted, str) and extracted.strip():
+                        return extracted.strip()
+                except Exception:
+                    return None
+            # If no tool call, try to use content of message
+            if response and getattr(response, "content", None):
+                text = response.content.strip()
+                return text or None
+        except Exception as e:
+            logger.warning(f"LLM extraction exception: {e}")
+            return None
+
 
 if __name__ == "__main__":
     web_search = WebSearch()
     search_response = asyncio.run(
         web_search.execute(
-            query="Python programming", fetch_content=True, num_results=1
+            query="Python programming", extract_content=True, num_results=1, goal="Ringkas isi halaman"
         )
     )
-    print(search_response.to_tool_result())
+    print(search_response.output)

@@ -68,15 +68,11 @@ class Manus(ToolCallAgent):
                     # gunakan ORM async
                     conv = await ConversationDB.objects.aget(id=str(conv_id))
                     messages_payload = []
-                    try:
-                        memory_db = await MemoryDB.objects.aget(conversation=conv)
-                        messages_payload = memory_db.to_dict_list()
-                    except MemoryDB.DoesNotExist:
-                        # fallback baca semua Message secara async
-                        temp_msgs = []
-                        async for m in MessageDB.objects.filter(conversation=conv).order_by("created_at"):
-                            temp_msgs.append(m)
-                        messages_payload = [m.to_dict() for m in temp_msgs]
+                    # Selalu baca dari tabel Message sebagai single source of truth
+                    temp_msgs = []
+                    async for m in MessageDB.objects.filter(conversation=conv).order_by("created_at"):
+                        temp_msgs.append(m)
+                    messages_payload = [m.to_dict() for m in temp_msgs]
 
                     if messages_payload:
                         from app.schema import Message as SchemaMessage
