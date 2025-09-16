@@ -157,8 +157,9 @@ class DaytonaSandboxClient(BaseSandboxClient):
         self.sandbox = self._daytona.create()
         # Keep configured work dir for path mapping only (do not enforce as cwd)
         self._work_dir = cfg.work_dir or "/workspace"
-        # Track current conversation for potential per-conversation behavior
-        self._conversation_id = conversation_id
+        # Track current conversation for potential per-conversation behavior; preserve if None
+        if conversation_id is not None:
+            self._conversation_id = conversation_id
 
     async def run_command(self, command: str, timeout: Optional[int] = None) -> str:
         if not self.sandbox:

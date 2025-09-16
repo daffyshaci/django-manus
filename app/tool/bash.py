@@ -51,6 +51,7 @@ class Bash(BaseTool):
                 await SANDBOX_CLIENT.cleanup()
             except Exception:
                 pass
+            # Recreate sandbox, preserving any conversation context already injected
             await SANDBOX_CLIENT.create(config=config.sandbox)
             return CLIResult(system="sandbox bash session restarted")
 

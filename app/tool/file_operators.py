@@ -62,7 +62,10 @@ class SandboxFileOperator(FileOperator):
     async def _ensure_sandbox_initialized(self) -> None:
         """Ensure sandbox is initialized before performing operations."""
         if not getattr(self.sandbox_client, "sandbox", None):
-            await self.sandbox_client.create(config=config.sandbox or SandboxSettings())
+            await self.sandbox_client.create(
+                config=config.sandbox or SandboxSettings(),
+                conversation_id=getattr(self.sandbox_client, "_conversation_id", None),
+            )
 
     async def read_file(self, path: PathLike) -> str:
         await self._ensure_sandbox_initialized()
