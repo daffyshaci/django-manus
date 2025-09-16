@@ -58,6 +58,14 @@ class BaseAgent(BaseModel, ABC):
             "Signature: (agent, role, content, base64_image, extra_kwargs)"
         ),
     )
+    # New: Optional persistence hook for files/artifacts: (agent, items_list[dict]) -> None | awaitable
+    persist_files_hook: Optional[Callable[["BaseAgent", List[dict]], None]] = Field(  # type: ignore
+        default=None,
+        description=(
+            "Optional callable invoked by update_files to persist file artifacts to external storage. "
+            "Each item dict may include: path, filename, size_bytes, sha256, mime_type, stored_content"
+        ),
+    )
 
     # Track pending async persistence tasks to ensure they complete before run() returns
     pending_persist_tasks: List[asyncio.Task] = Field(default_factory=list, exclude=True)  # type: ignore
@@ -182,6 +190,31 @@ class BaseAgent(BaseModel, ABC):
             except Exception as e:
                 logger.error(f"Error in persist_message_hook: {e}")
 
+    def update_files(self, files: List[dict] | dict, *, persist: bool = True) -> None:
+        """Persist file artifacts related to current conversation.
+
+        Each file item may contain:
+        - path: absolute path in sandbox (e.g., /workspace/foo.txt)
+        - filename: optional, derived from path if missing
+        - size_bytes, sha256, mime_type: optional metadata
+        - stored_content: optional snapshot of content (small text only)
+        """
+        items: List[dict] = files if isinstance(files, list) else [files]
+        if not items:
+            return
+        if persist and self.persist_files_hook:
+            try:
+                result = self.persist_files_hook(self, items)
+                if hasattr(result, "__await__"):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        task = loop.create_task(result)  # type: ignore[arg-type]
+                        self.pending_persist_tasks.append(task)
+                    except RuntimeError:
+                        asyncio.run(result)  # type: ignore[arg-type]
+            except Exception as e:
+                logger.error(f"Error in persist_files_hook: {e}")
+
     # === Django ORM persistence helper ===
     def attach_django_persistence(self, conversation_id: str) -> None:
         """Enable Django-based persistence for messages and memory using a Conversation ID.
@@ -257,6 +290,57 @@ class BaseAgent(BaseModel, ABC):
                 logger.error(f"Django persistence hook error: {e}")
 
         self.persist_message_hook = _hook
+
+        async def _files_hook(agent: "BaseAgent", items: List[dict]):
+            try:
+                from asgiref.sync import sync_to_async
+                from app.models import Conversation as ConversationDB
+                from app.models import FileArtifact
+                from django.utils import timezone as _tz
+
+                conv = await sync_to_async(ConversationDB.objects.get)(id=agent.conversation_id)
+                for it in items:
+                    path = (it.get("path") or "").strip()
+                    if not path:
+                        continue
+                    filename = (it.get("filename") or path.split("/")[-1]).strip()
+                    defaults = {
+                        "filename": filename,
+                        "size_bytes": it.get("size_bytes") or 0,
+                        "sha256": it.get("sha256") or "",
+                        "mime_type": it.get("mime_type") or "",
+                        "stored_content": it.get("stored_content") or "",
+                        "updated_at": _tz.now(),
+                    }
+                    # Update if exists for same conversation+path, else create
+                    from django.db import transaction as _tx
+                    async with _tx.async_atomic():
+                        obj, created = await sync_to_async(FileArtifact.objects.update_or_create)(
+                            conversation=conv,
+                            path=path,
+                            defaults=defaults,
+                        )
+                        # Emit WS event
+                        try:
+                            payload = {
+                                "id": str(obj.id),
+                                "conversation_id": str(conv.id),
+                                "path": obj.path,
+                                "filename": obj.filename,
+                                "size_bytes": obj.size_bytes,
+                                "sha256": obj.sha256,
+                                "mime_type": obj.mime_type,
+                                "created": created,
+                                "created_at": obj.created_at.isoformat() if obj.created_at else None,
+                                "updated_at": obj.updated_at.isoformat() if obj.updated_at else None,
+                            }
+                            await send_notification_async(str(conv.id), "file.created" if created else "file.updated", {"file": payload})
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.error(f"Django files persistence hook error: {e}")
+
+        self.persist_files_hook = _files_hook
 
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.

@@ -1,10 +1,10 @@
 from typing import List
 
-from googlesearch import search
+# from googlesearch import search
 
 from app.tool.search.base import SearchItem, WebSearchEngine
 
-import requests
+import requests # type: ignore
 
 def formated_serp(response, n=5):
     try:
@@ -63,8 +63,8 @@ class GoogleSearchEngine(WebSearchEngine):
                 # item is a dict from the API response
                 results.append(
                     SearchItem(
-                        title=item.get('title', ''), 
-                        url=item.get('link', ''), 
+                        title=item.get('title', ''),
+                        url=item.get('link', ''),
                         description=item.get('snippet', '')
                     )
                 )

@@ -11,6 +11,7 @@ from app.prompt.toolcall import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import TOOL_CHOICE_TYPE, AgentState, Message, ToolCall, ToolChoice
 from app.tool import CreateChatCompletion, Terminate, ToolCollection
 from app.consumers.notifications import send_notification_async
+from app.sandbox.client import SANDBOX_CLIENT
 
 
 TOOL_CALL_REQUIRED = "Tool calls required but none provided"
@@ -193,9 +194,51 @@ class ToolCallAgent(ReActAgent):
                 f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
             )
 
-            # Add tool response to memory via update_memory (persists through hook),
-            # except for special tools like 'terminate' where we intentionally skip persistence
-            # if not self._is_special_tool(command.function.name):
+            # If this is a special tool (e.g., ask_human), persist an assistant-facing message
+            # and skip persisting a tool-role message.
+            if self._is_special_tool(command.function.name):
+                raw = getattr(self, "_last_tool_result", None)
+                content = None
+                # Attempt to format a user-facing question for ask_human
+                try:
+                    if isinstance(raw, dict):
+                        payload = raw
+                    else:
+                        payload = getattr(raw, "output", None) or {}
+                    if isinstance(payload, dict) and payload.get("type") == "ask_human":
+                        question = payload.get("question") or ""
+                        attachments = payload.get("attachments") or []
+                        options = payload.get("response_options") or []
+                        lines: List[str] = []
+                        lines.append(f"Pertanyaan: {question}")
+                        if attachments:
+                            lines.append("Lampiran:")
+                            for att in attachments:
+                                t = att.get("type") or "file"
+                                u = att.get("url") or ""
+                                lines.append(f"- ({t}) {u}")
+                        if options:
+                            lines.append("Opsi jawaban:")
+                            for op in options:
+                                lines.append(f"- {op}")
+                        content = "\n".join(lines)
+                except Exception:
+                    # Fallback: use the observation string
+                    content = None
+
+                if not content:
+                    content = str(result)
+
+                self.update_memory(
+                    role="assistant",
+                    content=content,
+                    base64_image=self._current_base64_image,
+                )
+                results.append(str(result))
+                # Skip tool-role message for special tools and stop further execution
+                break
+
+            # Standard case: add tool response as a tool message
             self.update_memory(
                 role="tool",
                 content=result,
@@ -204,9 +247,6 @@ class ToolCallAgent(ReActAgent):
                 base64_image=self._current_base64_image,
             )
             results.append(result)
-            # else:
-            #     # For terminate, we skip saving the tool message to keep history clean
-            #     logger.info("Skipping persistence for special tool result: %s", command.function.name)
 
         return "\n\n".join(results)
 
@@ -223,9 +263,23 @@ class ToolCallAgent(ReActAgent):
             # Parse arguments
             args = json.loads(command.function.arguments or "{}")
 
+            # Inject conversation context into sandbox client for per-conversation isolation
+            try:
+                if self.conversation_id:
+                    SANDBOX_CLIENT._conversation_id = str(self.conversation_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
             result = await self.available_tools.execute(name=name, tool_input=args)
+
+            # Expose raw result for act() to use when needed (e.g., ask_human)
+            try:
+                setattr(self, "_last_tool_result", result)
+                setattr(self, "_last_tool_name", name)
+            except Exception:
+                pass
 
             # Handle special tools
             await self._handle_special_tool(name=name, result=result)

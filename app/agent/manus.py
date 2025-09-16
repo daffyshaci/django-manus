@@ -16,6 +16,9 @@ from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.consumers.notifications import send_notification_async
 
+from datetime import datetime
+
+today = datetime.now().strftime("%Y-%m-%d")
 
 class Manus(ToolCallAgent):
     """A versatile general-purpose agent with support for both local and MCP tools."""
@@ -23,7 +26,7 @@ class Manus(ToolCallAgent):
     name: str = "Manus"
     description: str = "A versatile agent that can solve various tasks using multiple tools including MCP-based tools"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root, today=today)
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 10000
@@ -44,7 +47,8 @@ class Manus(ToolCallAgent):
         )
     )
 
-    special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name])
+    # Stop the loop when either terminate or ask_human is invoked
+    special_tool_names: list[str] = Field(default_factory=lambda: [Terminate().name, AskHuman().name])
 
     # Track connected MCP servers
     connected_servers: Dict[str, str] = Field(default_factory=dict)  # server_id -> url/command

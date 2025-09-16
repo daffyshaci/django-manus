@@ -1,10 +1,15 @@
-"""File operation interfaces and implementations for local and sandbox environments."""
+"""File operation interfaces and sandbox-backed implementation.
 
-import asyncio
+This module exposes a single FileOperator implementation (SandboxFileOperator)
+that proxies all file and shell operations to the Daytona sandbox client.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional, Protocol, Tuple, Union, runtime_checkable
 
-from app.config import SandboxSettings
+from app.config import SandboxSettings, config
 from app.exceptions import ToolError
 from app.sandbox.client import SANDBOX_CLIENT
 
@@ -14,145 +19,96 @@ PathLike = Union[str, Path]
 
 @runtime_checkable
 class FileOperator(Protocol):
-    """Interface for file operations in different environments."""
+    """Interface for file operations used by StrReplaceEditor and other tools."""
 
-    async def read_file(self, path: PathLike) -> str:
-        """Read content from a file."""
-        ...
+    async def read_file(self, path: PathLike) -> str: ...
 
-    async def write_file(self, path: PathLike, content: str) -> None:
-        """Write content to a file."""
-        ...
+    async def write_file(self, path: PathLike, content: str) -> None: ...
 
-    async def is_directory(self, path: PathLike) -> bool:
-        """Check if path points to a directory."""
-        ...
+    async def is_directory(self, path: PathLike) -> bool: ...
 
-    async def exists(self, path: PathLike) -> bool:
-        """Check if path exists."""
-        ...
+    async def exists(self, path: PathLike) -> bool: ...
 
     async def run_command(
         self, cmd: str, timeout: Optional[float] = 120.0
-    ) -> Tuple[int, str, str]:
-        """Run a shell command and return (return_code, stdout, stderr)."""
-        ...
-
-
-class LocalFileOperator(FileOperator):
-    """File operations implementation for local filesystem."""
-
-    encoding: str = "utf-8"
-
-    async def read_file(self, path: PathLike) -> str:
-        """Read content from a local file."""
-        try:
-            return Path(path).read_text(encoding=self.encoding)
-        except Exception as e:
-            raise ToolError(f"Failed to read {path}: {str(e)}") from None
-
-    async def write_file(self, path: PathLike, content: str) -> None:
-        """Write content to a local file."""
-        try:
-            Path(path).write_text(content, encoding=self.encoding)
-        except Exception as e:
-            raise ToolError(f"Failed to write to {path}: {str(e)}") from None
-
-    async def is_directory(self, path: PathLike) -> bool:
-        """Check if path points to a directory."""
-        return Path(path).is_dir()
-
-    async def exists(self, path: PathLike) -> bool:
-        """Check if path exists."""
-        return Path(path).exists()
-
-    async def run_command(
-        self, cmd: str, timeout: Optional[float] = 120.0
-    ) -> Tuple[int, str, str]:
-        """Run a shell command locally."""
-        process = await asyncio.create_subprocess_shell(
-            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
-            return (
-                process.returncode or 0,
-                stdout.decode(),
-                stderr.decode(),
-            )
-        except asyncio.TimeoutError as exc:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            raise TimeoutError(
-                f"Command '{cmd}' timed out after {timeout} seconds"
-            ) from exc
+    ) -> Tuple[int, str, str]: ...
 
 
 class SandboxFileOperator(FileOperator):
-    """File operations implementation for sandbox environment."""
+    """File operations implementation for Daytona sandbox environment."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.sandbox_client = SANDBOX_CLIENT
 
-    async def _ensure_sandbox_initialized(self):
-        """Ensure sandbox is initialized."""
-        if not self.sandbox_client.sandbox:
-            await self.sandbox_client.create(config=SandboxSettings())
+    def _to_sandbox_path(self, path: PathLike) -> str:
+        """Map host absolute path to sandbox workspace POSIX path when needed."""
+        p_str = str(path)
+        # Normalize to POSIX-like
+        posix = p_str.replace("\\", "/")
+        work_dir = (config.sandbox.work_dir if config.sandbox else "/workspace").rstrip("/")
+        if posix.startswith(work_dir + "/") or posix == work_dir:
+            return posix
+        try:
+            p = Path(p_str)
+            if p.is_absolute():
+                rel = p.relative_to(config.workspace_root)
+                mapped = f"{work_dir}/{rel.as_posix()}"
+                return mapped
+        except Exception:
+            # If cannot map, return normalized
+            return posix
+        return posix
+
+    async def _ensure_sandbox_initialized(self) -> None:
+        """Ensure sandbox is initialized before performing operations."""
+        if not getattr(self.sandbox_client, "sandbox", None):
+            await self.sandbox_client.create(config=config.sandbox or SandboxSettings())
 
     async def read_file(self, path: PathLike) -> str:
-        """Read content from a file in sandbox."""
         await self._ensure_sandbox_initialized()
+        spath = self._to_sandbox_path(path)
         try:
-            return await self.sandbox_client.read_file(str(path))
-        except Exception as e:
+            return await self.sandbox_client.read_file(str(spath))
+        except Exception as e:  # pragma: no cover
             raise ToolError(f"Failed to read {path} in sandbox: {str(e)}") from None
 
     async def write_file(self, path: PathLike, content: str) -> None:
-        """Write content to a file in sandbox."""
         await self._ensure_sandbox_initialized()
+        spath = self._to_sandbox_path(path)
         try:
-            await self.sandbox_client.write_file(str(path), content)
-        except Exception as e:
+            await self.sandbox_client.write_file(str(spath), content)
+        except Exception as e:  # pragma: no cover
             raise ToolError(f"Failed to write to {path} in sandbox: {str(e)}") from None
 
     async def is_directory(self, path: PathLike) -> bool:
-        """Check if path points to a directory in sandbox."""
         await self._ensure_sandbox_initialized()
+        spath = self._to_sandbox_path(path)
         result = await self.sandbox_client.run_command(
-            f"test -d {path} && echo 'true' || echo 'false'"
+            f"test -d {spath} && echo 'true' || echo 'false'"
         )
-        return result.strip() == "true"
+        return (result or "").strip() == "true"
 
     async def exists(self, path: PathLike) -> bool:
-        """Check if path exists in sandbox."""
         await self._ensure_sandbox_initialized()
+        spath = self._to_sandbox_path(path)
         result = await self.sandbox_client.run_command(
-            f"test -e {path} && echo 'true' || echo 'false'"
+            f"test -e {spath} && echo 'true' || echo 'false'"
         )
-        return result.strip() == "true"
+        return (result or "").strip() == "true"
 
     async def run_command(
         self, cmd: str, timeout: Optional[float] = 120.0
     ) -> Tuple[int, str, str]:
-        """Run a command in sandbox environment."""
         await self._ensure_sandbox_initialized()
         try:
             stdout = await self.sandbox_client.run_command(
                 cmd, timeout=int(timeout) if timeout else None
             )
-            return (
-                0,  # Always return 0 since we don't have explicit return code from sandbox
-                stdout,
-                "",  # No stderr capture in the current sandbox implementation
-            )
-        except TimeoutError as exc:
+            # Current sandbox client returns stdout only; no explicit return code or stderr
+            return 0, stdout, ""
+        except TimeoutError as exc:  # pragma: no cover
             raise TimeoutError(
                 f"Command '{cmd}' timed out after {timeout} seconds in sandbox"
             ) from exc
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover
             return 1, "", f"Error executing command in sandbox: {str(exc)}"

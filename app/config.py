@@ -1,6 +1,5 @@
 import json
 import threading
-import tomllib
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -31,7 +30,7 @@ class LLMSettings(BaseModel):
 
 
 class ProxySettings(BaseModel):
-    server: str = Field(None, description="Proxy server address")
+    server: str | None = Field(None, description="Proxy server address")
     username: Optional[str] = Field(None, description="Proxy username")
     password: Optional[str] = Field(None, description="Proxy password")
 
@@ -95,13 +94,34 @@ class SandboxSettings(BaseModel):
     """Configuration for the execution sandbox"""
 
     use_sandbox: bool = Field(False, description="Whether to use the sandbox")
+    # Sandbox provider selection: 'local' uses internal Docker sandbox, 'daytona' uses Daytona SDK
+    provider: str = Field(
+        default="local",
+        description="Sandbox provider to use: 'local' or 'daytona'",
+    )
+    # Base image applies to local/docker sandbox implementations
     image: str = Field("python:3.12-slim", description="Base image")
+    # Working directory inside the sandbox (both providers should honor this)
     work_dir: str = Field("/workspace", description="Container working directory")
     memory_limit: str = Field("512m", description="Memory limit")
     cpu_limit: float = Field(1.0, description="CPU limit")
     timeout: int = Field(300, description="Default command timeout (seconds)")
     network_enabled: bool = Field(
         False, description="Whether network access is allowed"
+    )
+
+    # Daytona-specific optional configuration (can also be set via environment variables)
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Daytona API key (optional if provided via env DAYTONA_API_KEY)",
+    )
+    api_url: Optional[str] = Field(
+        default=None,
+        description="Daytona API URL/endpoint (optional if provided via env DAYTONA_API_URL)",
+    )
+    target: Optional[str] = Field(
+        default=None,
+        description="Daytona target/region identifier (optional if provided via env DAYTONA_TARGET)",
     )
 
 
@@ -192,104 +212,88 @@ class Config:
                     self._load_initial_config()
                     self._initialized = True
 
-    @staticmethod
-    def _get_config_path() -> Path:
-        root = PROJECT_ROOT
-        config_path = root / "config" / "config.toml"
-        if config_path.exists():
-            return config_path
-        example_path = root / "config" / "config.example.toml"
-        if example_path.exists():
-            return example_path
-        raise FileNotFoundError("No configuration file found in config directory")
-
-    def _load_config(self) -> dict:
-        config_path = self._get_config_path()
-        with config_path.open("rb") as f:
-            return tomllib.load(f)
-
     def _load_initial_config(self):
-        raw_config = self._load_config()
-        base_llm = raw_config.get("llm", {})
-        llm_overrides = {
-            k: v for k, v in raw_config.get("llm", {}).items() if isinstance(v, dict)
-        }
+        # Build configuration purely from Django settings, do not read config files
+        try:
+            from django.conf import settings as dj
+        except Exception:
+            # If Django settings aren't ready, use safe defaults
+            class Dummy:
+                pass
+            dj = Dummy()
 
+        # LLM defaults sourced from Django settings when available
         default_settings = {
-            "model": base_llm.get("model"),
-            "base_url": base_llm.get("base_url"),
-            "api_key": base_llm.get("api_key"),
-            "max_tokens": base_llm.get("max_tokens", 4096),
-            "max_input_tokens": base_llm.get("max_input_tokens"),
-            "temperature": base_llm.get("temperature", 1.0),
-            "api_type": base_llm.get("api_type", ""),
-            "api_version": base_llm.get("api_version", ""),
+            "model": getattr(dj, "LLM_MODEL", "gpt-4o-mini"),
+            "base_url": getattr(dj, "LLM_BASE_URL", "https://api.openai.com/v1"),
+            "api_key": (
+                getattr(dj, "OPENAI_API_KEY", None)
+                or getattr(dj, "AIMLAPI_KEY", None)
+                or "test"
+            ),
+            "max_tokens": getattr(dj, "LLM_MAX_TOKENS", 4096),
+            "max_input_tokens": getattr(dj, "LLM_MAX_INPUT_TOKENS", None),
+            "temperature": getattr(dj, "LLM_TEMPERATURE", 1.0),
+            "api_type": getattr(dj, "LLM_API_TYPE", "openai"),
+            "api_version": getattr(dj, "LLM_API_VERSION", ""),
         }
 
-        # handle browser config.
-        browser_config = raw_config.get("browser", {})
+        # Optional browser config from Django settings as a dict-like
         browser_settings = None
-
-        if browser_config:
-            # handle proxy settings.
-            proxy_config = browser_config.get("proxy", {})
+        browser_cfg = getattr(dj, "BROWSER_CONFIG", None)
+        if isinstance(browser_cfg, dict) and browser_cfg:
+            proxy_cfg = browser_cfg.get("proxy") or {}
             proxy_settings = None
-
-            if proxy_config and proxy_config.get("server"):
+            if isinstance(proxy_cfg, dict) and proxy_cfg.get("server"):
                 proxy_settings = ProxySettings(
                     **{
                         k: v
-                        for k, v in proxy_config.items()
-                        if k in ["server", "username", "password"] and v
+                        for k, v in proxy_cfg.items()
+                        if k in ["server", "username", "password"] and v is not None
                     }
                 )
 
-            # filter valid browser config parameters.
-            valid_browser_params = {
+            valid_params = {
                 k: v
-                for k, v in browser_config.items()
+                for k, v in browser_cfg.items()
                 if k in BrowserSettings.__annotations__ and v is not None
             }
-
-            # if there is proxy settings, add it to the parameters.
             if proxy_settings:
-                valid_browser_params["proxy"] = proxy_settings
+                valid_params["proxy"] = proxy_settings
+            if valid_params:
+                browser_settings = BrowserSettings(**valid_params)
 
-            # only create BrowserSettings when there are valid parameters.
-            if valid_browser_params:
-                browser_settings = BrowserSettings(**valid_browser_params)
-
-        search_config = raw_config.get("search", {})
+        # Optional search config
         search_settings = None
-        if search_config:
-            search_settings = SearchSettings(**search_config)
-        sandbox_config = raw_config.get("sandbox", {})
-        if sandbox_config:
-            sandbox_settings = SandboxSettings(**sandbox_config)
-        else:
-            sandbox_settings = SandboxSettings()
+        search_cfg = getattr(dj, "SEARCH_CONFIG", None)
+        if isinstance(search_cfg, dict) and search_cfg:
+            search_settings = SearchSettings(**search_cfg)
 
-        mcp_config = raw_config.get("mcp", {})
-        mcp_settings = None
-        if mcp_config:
-            # Load server configurations from JSON
-            mcp_config["servers"] = MCPSettings.load_server_config()
-            mcp_settings = MCPSettings(**mcp_config)
-        else:
-            mcp_settings = MCPSettings(servers=MCPSettings.load_server_config())
+        # Sandbox config: always use sandbox and Daytona provider
+        sandbox_settings = SandboxSettings(
+            use_sandbox=True,
+            provider="daytona",
+            image=getattr(dj, "SANDBOX_IMAGE", "python:3.12-slim"),
+            work_dir=getattr(dj, "SANDBOX_WORK_DIR", "/workspace"),
+            memory_limit=getattr(dj, "SANDBOX_MEMORY_LIMIT", "512m"),
+            cpu_limit=getattr(dj, "SANDBOX_CPU_LIMIT", 1.0),
+            timeout=getattr(dj, "SANDBOX_TIMEOUT", 300),
+            network_enabled=getattr(dj, "SANDBOX_NETWORK_ENABLED", True),
+            api_key=getattr(dj, "DAYTONA_API_KEY", None),
+            api_url=getattr(dj, "DAYTONA_API_URL", None),
+            target=getattr(dj, "DAYTONA_TARGET", None),
+        )
 
-        run_flow_config = raw_config.get("runflow")
-        if run_flow_config:
-            run_flow_settings = RunflowSettings(**run_flow_config)
-        else:
-            run_flow_settings = RunflowSettings()
+        # MCP settings optional; load JSON if exists
+        mcp_servers = MCPSettings.load_server_config()
+        mcp_settings = MCPSettings(servers=mcp_servers)
+
+        run_flow_cfg = getattr(dj, "RUNFLOW_CONFIG", None) or {}
+        run_flow_settings = RunflowSettings(**run_flow_cfg) if isinstance(run_flow_cfg, dict) else RunflowSettings()
+
         config_dict = {
             "llm": {
                 "default": default_settings,
-                **{
-                    name: {**default_settings, **override_config}
-                    for name, override_config in llm_overrides.items()
-                },
             },
             "sandbox": sandbox_settings,
             "browser_config": browser_settings,

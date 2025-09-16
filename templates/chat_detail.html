@@ -234,7 +234,11 @@
         );
         break;
       case "agent.finished":
-        appendInfo("Selesai.");
+        if (payload && payload.tool === "ask_human") {
+          appendInfo("Menunggu jawaban pengguna...");
+        } else {
+          appendInfo("Selesai.");
+        }
         setThinking(false);
         break;
       case "agent.cleanup_start":

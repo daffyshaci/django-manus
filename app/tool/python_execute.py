@@ -1,21 +1,18 @@
-import multiprocessing
-import sys
 import time
-from io import StringIO
 from typing import Dict
 
-from app.tool.base import BaseTool
+from app.tool.base import BaseTool, ToolResult
+from app.config import config
+from app.sandbox.client import SANDBOX_CLIENT
 
 
 class PythonExecute(BaseTool):
-    """A tool for executing Python code with timeout and safety restrictions.
-        
-        Default timeout is set to 30 seconds to handle more complex operations.
-        You can override the timeout by passing a custom value.
-        """
+    """A tool for executing Python code safely inside the sandbox with timeout restrictions.
+    Default timeout is set to 30 seconds; you can override it by passing a custom value.
+    """
 
     name: str = "python_execute"
-    description: str = "Executes Python code string with 30-second timeout (configurable). Note: Only print outputs are visible, function return values are not captured. Use print statements to see results."
+    description: str = "Executes Python code string inside sandbox with 30-second timeout (configurable). Note: Only print outputs are visible, function return values are not captured. Use print statements to see results."
     parameters: dict = {
         "type": "object",
         "properties": {
@@ -34,65 +31,25 @@ class PythonExecute(BaseTool):
         "required": ["code"],
     }
 
-    def _run_code(self, code: str, result_dict: dict, safe_globals: dict) -> None:
-        original_stdout = sys.stdout
-        try:
-            output_buffer = StringIO()
-            sys.stdout = output_buffer
-            exec(code, safe_globals, safe_globals)
-            result_dict["observation"] = output_buffer.getvalue()
-            result_dict["success"] = True
-        except Exception as e:
-            result_dict["observation"] = str(e)
-            result_dict["success"] = False
-        finally:
-            sys.stdout = original_stdout
-
     async def execute(
         self,
         code: str,
         timeout: int = 30,
-    ) -> Dict:
+    ) -> ToolResult:
+        """Executes the provided Python code in the sandbox.
+        Writes a temporary file into the sandbox workspace and executes it with python3/python.
         """
-        Executes the provided Python code with a timeout.
-
-        Args:
-            code (str): The Python code to execute.
-            timeout (int): Execution timeout in seconds.
-
-        Returns:
-            Dict: Contains 'output' with execution output or error message and 'success' status.
-        """
-
-        with multiprocessing.Manager() as manager:
-            result = manager.dict({"observation": "", "success": False})
-            if isinstance(__builtins__, dict):
-                safe_globals = {"__builtins__": __builtins__}
-            else:
-                safe_globals = {"__builtins__": __builtins__.__dict__.copy()}
-            proc = multiprocessing.Process(
-                target=self._run_code, args=(code, result, safe_globals)
-            )
-            proc.start()
-            proc.join(timeout)
-
-            # timeout process
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(1)
-                if proc.is_alive():
-                    proc.kill()  # Force kill if terminate didn't work
-                    proc.join()
-                return {
-                    "observation": f"Execution timeout after {timeout} seconds. Consider optimizing your code or increasing the timeout parameter.",
-                    "success": False,
-                }
-            
-            # Check if process exited normally
-            if proc.exitcode != 0 and result.get("success", False):
-                return {
-                    "observation": f"Process exited with code {proc.exitcode}. This might indicate a critical error.",
-                    "success": False,
-                }
-            
-            return dict(result)
+        try:
+            if not getattr(SANDBOX_CLIENT, "sandbox", None):
+                await SANDBOX_CLIENT.create(config=config.sandbox)
+            work_dir = (config.sandbox.work_dir or "/workspace").rstrip("/")
+            tmp_dir = f"{work_dir}/.manus_tmp"
+            await SANDBOX_CLIENT.run_command(f"mkdir -p {tmp_dir}")
+            filename = f"{tmp_dir}/exec_{int(time.time()*1000)}.py"
+            await SANDBOX_CLIENT.write_file(filename, code)
+            # Try python3 first, fallback to python; redirect stderr to stdout
+            cmd = f"python3 {filename} 2>&1 || python {filename} 2>&1"
+            output = await SANDBOX_CLIENT.run_command(cmd, timeout=timeout)
+            return ToolResult(output=output, status="success")
+        except Exception as e:
+            return ToolResult(error=f"Sandbox python execution failed: {str(e)}", status="error")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Dict, Optional
 
-from celery import shared_task
+from celery import shared_task  # type: ignore
 
 from app.agent.manus import Manus
 from app.logger import logger
@@ -47,10 +47,11 @@ def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, ag
             else:
                 result = await agent.run(prompt)
             logger.info("Request processing completed.")
-            return result or ""
+            return "done"
         finally:
             # Pastikan resource agent dibersihkan
             await agent.cleanup()
+
 
     # Jalankan konteks async di dalam task Celery sync
     return asyncio.run(_run())

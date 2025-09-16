@@ -10,9 +10,8 @@ from app.tool import BaseTool
 from app.tool.base import CLIResult, ToolResult
 from app.tool.file_operators import (
     FileOperator,
-    LocalFileOperator,
-    PathLike,
     SandboxFileOperator,
+    PathLike,
 )
 
 
@@ -99,17 +98,12 @@ class StrReplaceEditor(BaseTool):
         "required": ["command", "path"],
     }
     _file_history: DefaultDict[PathLike, List[str]] = defaultdict(list)
-    _local_operator: LocalFileOperator = LocalFileOperator()
     _sandbox_operator: SandboxFileOperator = SandboxFileOperator()
 
     # def _get_operator(self, use_sandbox: bool) -> FileOperator:
     def _get_operator(self) -> FileOperator:
         """Get the appropriate file operator based on execution mode."""
-        return (
-            self._sandbox_operator
-            if config.sandbox.use_sandbox
-            else self._local_operator
-        )
+        return self._sandbox_operator
 
     async def execute(
         self,

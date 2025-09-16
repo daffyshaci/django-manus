@@ -112,6 +112,10 @@ class WebContentFetcher:
         Returns:
             Structured text content organized by headings or None if fetching fails
         """
+        # Sanitize incoming URL to avoid issues with stray quotes/backticks/whitespace
+        url = (url or "").strip().strip('`"\'')
+        if not url:
+            return None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
@@ -223,16 +227,16 @@ class WebSearch(BaseTool):
                 "description": "Whether to extract content from result pages (sequential with early-stop when goal present). Default is true.",
                 "default": True,
             },
-            "goal":{
+            "goal": {
                 "type": "string",
-                "description": "Extraction goal for 'extract_content'",
+                "description": "(optional) Extraction goal for 'extract_content'",
             }
         },
-        "required": ["query"],
+        "required": ["query", "goal"],
     }
     _search_engine: dict[str, WebSearchEngine] = {
-        "yahoo": YahooSearchEngine(),
         "google": GoogleSearchEngine(),
+        "yahoo": YahooSearchEngine(),
         "baidu": BaiduSearchEngine(),
         "duckduckgo": DuckDuckGoSearchEngine(),
         "bing": BingSearchEngine(),
@@ -342,7 +346,7 @@ class WebSearch(BaseTool):
                             # build snippet from normalized whitespace
                             try:
                                 normalized = " ".join(content.split())
-                                snippet = (normalized[:800]).strip() if normalized else None
+                                snippet = (normalized[:10000]).strip() if normalized else None
                             except Exception:
                                 snippet = None
                             break
@@ -407,7 +411,7 @@ class WebSearch(BaseTool):
             return [
                 SearchResult(
                     position=i + 1,
-                    url=item.url,
+                    url=(item.url or "").strip().strip('`"\''),
                     title=item.title
                     or f"Result {i+1}",  # Ensure we always have a title
                     description=item.description or "",
@@ -456,7 +460,7 @@ class WebSearch(BaseTool):
         preferred = (
             getattr(config.search_config, "engine", "yahoo").lower()
             if config.search_config
-            else "yahoo"
+            else "google"
         )
         fallbacks = (
             [engine.lower() for engine in config.search_config.fallback_engines]
@@ -508,9 +512,11 @@ class WebSearch(BaseTool):
             user_msg = {
                 "role": "user",
                 "content": (
-                    f"Goal:\n{goal}\n\n"
+                    "**RAW TEXT:**\n"
+                    f"{page_content}"
+                    "**EXTRACTION REQUEST:** (Optional)\n"
+                    f"{goal or 'No specific request'}\n"
                     f"URL:\n{url or ''}\n\n"
-                    f"Page Content (truncated to 10k chars):\n{page_content}"
                 ),
             }
 

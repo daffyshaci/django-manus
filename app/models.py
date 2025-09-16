@@ -3,6 +3,7 @@ from common.models import TimeStampedUUIDModel
 from django.contrib.auth import get_user_model
 from django.utils.translation import gettext_lazy as _
 from typing import Any, List, Literal, Optional, Union
+from django.utils import timezone
 
 User = get_user_model()
 
@@ -183,4 +184,29 @@ class Memory(TimeStampedUUIDModel):
                     "content": getattr(item, "content", None),
                 })
         return result
+
+
+class FileArtifact(models.Model):
+    """Stores metadata about files produced/used in a conversation."""
+
+    conversation = models.ForeignKey(
+        'Conversation', on_delete=models.CASCADE, related_name='files'
+    )
+    path = models.CharField(max_length=512)
+    filename = models.CharField(max_length=255)
+    size_bytes = models.BigIntegerField(default=0)
+    sha256 = models.CharField(max_length=64, blank=True, default="")
+    mime_type = models.CharField(max_length=100, blank=True, default="")
+    stored_content = models.TextField(blank=True, default="")  # optional snapshot of content
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["conversation", "filename"]),
+            models.Index(fields=["conversation", "path"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.filename} ({self.path})"
 

@@ -39,6 +39,9 @@ class ToolResult(BaseModel):
     error: Optional[str] = Field(default=None)
     base64_image: Optional[str] = Field(default=None)
     system: Optional[str] = Field(default=None)
+    status: Optional[str] = Field(
+        default=None, description="Execution status, e.g., 'success' or 'error'"
+    )
 
     class Config:
         arbitrary_types_allowed = True
@@ -61,10 +64,11 @@ class ToolResult(BaseModel):
             error=combine_fields(self.error, other.error),
             base64_image=combine_fields(self.base64_image, other.base64_image, False),
             system=combine_fields(self.system, other.system),
+            status=combine_fields(self.status, other.status, False),
         )
 
     def __str__(self):
-        return f"Error: {self.error}" if self.error else self.output
+        return f"Error: {self.error}" if self.error else str(self.output)
 
     def replace(self, **kwargs):
         """Returns a new ToolResult with the given fields replaced."""
