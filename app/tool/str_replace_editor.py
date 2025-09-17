@@ -2,14 +2,13 @@
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, List, Literal, Optional, get_args
+from typing import Any, DefaultDict, List, Literal, Optional, get_args, ClassVar
 
 from app.config import config
 from app.exceptions import ToolError
 from app.tool import BaseTool
 from app.tool.base import CLIResult, ToolResult
 from app.tool.file_operators import (
-    FileOperator,
     SandboxFileOperator,
     PathLike,
 )
@@ -59,7 +58,8 @@ def maybe_truncate(
 class StrReplaceEditor(BaseTool):
     """A tool for viewing, creating, and editing files with sandbox support."""
 
-    name: str = "str_replace_editor"
+    # Renamed tool exposure for better clarity to LLMs
+    name: str = "file_editor"
     description: str = _STR_REPLACE_EDITOR_DESCRIPTION
     parameters: dict = {
         "type": "object",
@@ -70,7 +70,7 @@ class StrReplaceEditor(BaseTool):
                 "type": "string",
             },
             "path": {
-                "description": "Absolute path to file or directory.",
+                "description": "Sandbox path (POSIX). Use '/workspace/...' or shorthand '/file.py' to refer to '/workspace/file.py'. Do NOT use host OS paths like 'C:\\...'.",
                 "type": "string",
             },
             "file_text": {
@@ -97,11 +97,11 @@ class StrReplaceEditor(BaseTool):
         },
         "required": ["command", "path"],
     }
-    _file_history: DefaultDict[PathLike, List[str]] = defaultdict(list)
-    _sandbox_operator: SandboxFileOperator = SandboxFileOperator()
+    _file_history: ClassVar[DefaultDict[PathLike, List[str]]] = defaultdict(list)
+    _sandbox_operator: ClassVar[SandboxFileOperator] = SandboxFileOperator()
 
-    # def _get_operator(self, use_sandbox: bool) -> FileOperator:
-    def _get_operator(self) -> FileOperator:
+    # def _get_operator(self, use_sandbox: bool) -> SandboxFileOperator:
+    def _get_operator(self) -> SandboxFileOperator:
         """Get the appropriate file operator based on execution mode."""
         return self._sandbox_operator
 
@@ -158,40 +158,45 @@ class StrReplaceEditor(BaseTool):
         return str(result)
 
     async def validate_path(
-        self, command: str, path: Path, operator: FileOperator
+        self, command: str, path: Path, operator: SandboxFileOperator
     ) -> None:
         """Validate path and command combination based on execution environment."""
-        # Check if path is absolute
-        if not path.is_absolute():
-            raise ToolError(f"The path {path} is not an absolute path")
+        # Only accept POSIX-style absolute sandbox paths (must start with '/')
+        raw = str(path)
+        posix = raw.replace("\\", "/")
+        if not posix.startswith("/"):
+            raise ToolError(
+                "Invalid path for sandbox. Use POSIX absolute paths only, e.g. '/file.py' or '/workspace/file.py'. "
+                "Do NOT use host OS paths like 'C:\\...'."
+            )
 
         # Only check if path exists for non-create commands
         if command != "create":
-            if not await operator.exists(path):
+            if not await operator.exists(posix):
                 raise ToolError(
-                    f"The path {path} does not exist. Please provide a valid path."
+                    f"The path {posix} does not exist. Please provide a valid path."
                 )
 
             # Check if path is a directory
-            is_dir = await operator.is_directory(path)
+            is_dir = await operator.is_directory(posix)
             if is_dir and command != "view":
                 raise ToolError(
-                    f"The path {path} is a directory and only the `view` command can be used on directories"
+                    f"The path {posix} is a directory and only the `view` command can be used on directories"
                 )
 
         # Check if file exists for create command
         elif command == "create":
-            exists = await operator.exists(path)
+            exists = await operator.exists(posix)
             if exists:
                 raise ToolError(
-                    f"File already exists at: {path}. Cannot overwrite files using command `create`."
+                    f"File already exists at: {posix}. Cannot overwrite files using command `create`."
                 )
 
     async def view(
         self,
         path: PathLike,
         view_range: Optional[List[int]] = None,
-        operator: FileOperator = None,
+        operator: SandboxFileOperator = None,
     ) -> CLIResult:
         """Display file or directory content."""
         # Determine if path is a directory
@@ -210,7 +215,7 @@ class StrReplaceEditor(BaseTool):
             return await self._view_file(path, operator, view_range)
 
     @staticmethod
-    async def _view_directory(path: PathLike, operator: FileOperator) -> CLIResult:
+    async def _view_directory(path: PathLike, operator: SandboxFileOperator) -> CLIResult:
         """Display directory contents."""
         find_cmd = f"find {path} -maxdepth 2 -not -path '*/\\.*'"
 
@@ -228,7 +233,7 @@ class StrReplaceEditor(BaseTool):
     async def _view_file(
         self,
         path: PathLike,
-        operator: FileOperator,
+        operator: SandboxFileOperator,
         view_range: Optional[List[int]] = None,
     ) -> CLIResult:
         """Display file content, optionally within a specified line range."""
@@ -280,7 +285,7 @@ class StrReplaceEditor(BaseTool):
         path: PathLike,
         old_str: str,
         new_str: Optional[str] = None,
-        operator: FileOperator = None,
+        operator: SandboxFileOperator = None,
     ) -> CLIResult:
         """Replace a unique string in a file with a new string."""
         # Read file content and expand tabs
@@ -336,7 +341,7 @@ class StrReplaceEditor(BaseTool):
         path: PathLike,
         insert_line: int,
         new_str: str,
-        operator: FileOperator = None,
+        operator: SandboxFileOperator = None,
     ) -> CLIResult:
         """Insert text at a specific line in a file."""
         # Read and prepare content
@@ -386,7 +391,7 @@ class StrReplaceEditor(BaseTool):
         return CLIResult(output=success_msg)
 
     async def undo_edit(
-        self, path: PathLike, operator: FileOperator = None
+        self, path: PathLike, operator: SandboxFileOperator = None
     ) -> CLIResult:
         """Revert the last edit made to a file."""
         if not self._file_history[path]:

@@ -41,23 +41,51 @@ class SandboxFileOperator(FileOperator):
         self.sandbox_client = SANDBOX_CLIENT
 
     def _to_sandbox_path(self, path: PathLike) -> str:
-        """Map host absolute path to sandbox workspace POSIX path when needed."""
+        """Map user-provided path to sandbox workspace POSIX path when needed.
+
+        Rules:
+        - Always canonicalize to '/workspace' inside the sandbox to avoid leaking host paths.
+        - If path already starts with '/workspace', keep as is.
+        - If path starts with '/' but NOT with '/workspace', interpret it as inside '/workspace'.
+        - If path is an absolute HOST path under config.workspace_root, remap to '/workspace/<relative>'.
+        - If path is an absolute HOST path outside workspace_root, place under '/workspace/<basename>'.
+        - Otherwise, treat as relative and place under '/workspace/<path>'.
+        """
         p_str = str(path)
-        # Normalize to POSIX-like
         posix = p_str.replace("\\", "/")
-        work_dir = (config.sandbox.work_dir if config.sandbox else "/workspace").rstrip("/")
-        if posix.startswith(work_dir + "/") or posix == work_dir:
+        canonical = "/workspace"
+        work_dir = (
+            (config.sandbox.work_dir if config.sandbox else canonical).replace("\\", "/").rstrip("/")
+        )
+
+        # Already in canonical sandbox workspace
+        if posix == canonical or posix.startswith(canonical + "/"):
             return posix
+
+        # Paths under configured work_dir (host-style or posix) -> map to canonical
+        if posix == work_dir or posix.startswith(work_dir + "/"):
+            remainder = posix[len(work_dir):].lstrip("/")
+            return canonical if not remainder else f"{canonical}/{remainder}"
+
+        # Any other absolute posix path -> treat as inside canonical workspace
+        if posix.startswith("/"):
+            return f"{canonical}/{posix.lstrip('/')}"
+
+        # Absolute host paths -> map under canonical workspace
         try:
             p = Path(p_str)
             if p.is_absolute():
-                rel = p.relative_to(config.workspace_root)
-                mapped = f"{work_dir}/{rel.as_posix()}"
-                return mapped
+                ws_root = Path(config.workspace_root) if getattr(config, "workspace_root", None) else None
+                if ws_root and str(p).startswith(str(ws_root)):
+                    rel = p.relative_to(ws_root)
+                    return f"{canonical}/{rel.as_posix()}"
+                return f"{canonical}/{p.name}"
         except Exception:
-            # If cannot map, return normalized
-            return posix
-        return posix
+            # fall through to treat as relative
+            pass
+
+        # Relative path -> under canonical workspace
+        return f"{canonical}/{posix}"
 
     async def _ensure_sandbox_initialized(self) -> None:
         """Ensure sandbox is initialized before performing operations."""
