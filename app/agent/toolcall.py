@@ -145,7 +145,7 @@ class ToolCallAgent(ReActAgent):
                 if content:
                     self.update_memory("assistant", content)
                 # Continue only if there are tools selected
-                return bool(content)
+                return True
 
             self.update_memory("assistant", content, tool_calls=self.tool_calls)
             return bool(self.tool_calls)

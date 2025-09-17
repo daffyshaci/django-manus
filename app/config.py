@@ -96,7 +96,7 @@ class SandboxSettings(BaseModel):
     use_sandbox: bool = Field(False, description="Whether to use the sandbox")
     # Sandbox provider selection: 'local' uses internal Docker sandbox, 'daytona' uses Daytona SDK
     provider: str = Field(
-        default="local",
+        default="daytona",
         description="Sandbox provider to use: 'local' or 'daytona'",
     )
     # Base image applies to local/docker sandbox implementations
@@ -215,7 +215,7 @@ class Config:
     def _load_initial_config(self):
         # Build configuration purely from Django settings, do not read config files
         try:
-            from django.conf import settings as dj
+            from django.conf import settings as dj # type: ignore
             is_dj_configured = getattr(dj, "configured", False)
         except Exception:
             dj = None
@@ -331,7 +331,7 @@ class Config:
         return self._config.run_flow_config
 
     @property
-    def workspace_root(self) -> Path:
+    def workspace_root(self) -> str:
         """Get the workspace root directory"""
         return WORKSPACE_ROOT
 
