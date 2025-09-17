@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 # from googlesearch import search
@@ -5,6 +6,7 @@ from typing import List
 from app.tool.search.base import SearchItem, WebSearchEngine
 
 import requests # type: ignore
+
 
 def formated_serp(response, n=5):
     try:
@@ -17,7 +19,8 @@ def formated_serp(response, n=5):
     except KeyError:
         return response['organic'][:n]
 
-def get_serp(q:str, gl:str='us'):
+
+def get_serp(q: str, gl: str = 'us'):
     try:
         url = "https://google.serper.dev/search"
 
@@ -25,8 +28,10 @@ def get_serp(q:str, gl:str='us'):
             "q": q,
             "gl": gl,
         }
+        # Read API key from environment to avoid hardcoding secrets
+        api_key = os.getenv("SERPER_API_KEY") or os.getenv("GOOGLE_SERPER_API_KEY")
         headers = {
-            'X-API-KEY': 'bcdf4d4ffb4d7e7191c3092d7c54a03b36e57563',
+            'X-API-KEY': api_key or '',
             'Content-Type': 'application/json'
         }
 
@@ -37,7 +42,6 @@ def get_serp(q:str, gl:str='us'):
     except requests.exceptions.RequestException as e:
         print(f"Request failed: {e}")
         raise e
-
 
 
 class GoogleSearchEngine(WebSearchEngine):
