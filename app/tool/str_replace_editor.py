@@ -321,6 +321,10 @@ class StrReplaceEditor(BaseTool):
         # Save the original content to history
         self._file_history[path].append(file_content)
 
+        # Update agent files if agent context is available
+        if hasattr(self, 'agent') and self.agent is not None:
+            await self.agent.update_files()
+
         # Create a snippet of the edited section
         replacement_line = file_content.split(old_str)[0].count("\n")
         start_line = max(0, replacement_line - SNIPPET_LINES)
@@ -379,6 +383,10 @@ class StrReplaceEditor(BaseTool):
         await operator.write_file(path, new_file_text)
         self._file_history[path].append(file_text)
 
+        # Update agent files if agent context is available
+        if hasattr(self, 'agent') and self.agent is not None:
+            await self.agent.update_files()
+
         # Prepare success message
         success_msg = f"The file {path} has been edited. "
         success_msg += self._make_output(
@@ -399,6 +407,10 @@ class StrReplaceEditor(BaseTool):
 
         old_text = self._file_history[path].pop()
         await operator.write_file(path, old_text)
+
+        # Update agent files if agent context is available
+        if hasattr(self, 'agent') and self.agent is not None:
+            await self.agent.update_files()
 
         return CLIResult(
             output=f"Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}"

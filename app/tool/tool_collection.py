@@ -23,11 +23,16 @@ class ToolCollection:
         return [tool.to_param() for tool in self.tools]
 
     async def execute(
-        self, *, name: str, tool_input: Dict[str, Any] = None
+        self, *, name: str, tool_input: Dict[str, Any] = None, agent: Any = None
     ) -> ToolResult:
         tool = self.tool_map.get(name)
         if not tool:
             return ToolFailure(error=f"Tool {name} is invalid")
+        
+        # Inject agent context into tool if supported
+        if agent is not None and hasattr(tool, 'agent'):
+            tool.agent = agent
+        
         try:
             result = await tool(**tool_input)
             return result

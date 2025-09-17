@@ -35,3 +35,46 @@ class DataAnalysis(ToolCallAgent):
             Terminate(),
         )
     )
+
+    @classmethod
+    async def create(cls, **kwargs) -> "DataAnalysis":
+        """Factory method to create and properly initialize a DataAnalysis instance."""
+        instance = cls(**kwargs)
+        # Attach Django persistence automatically if conversation_id provided
+        conv_id = kwargs.get("conversation_id")
+        if conv_id:
+            try:
+                instance.attach_django_persistence(str(conv_id))
+                # Preload history from DB into in-memory memory so the agent has context
+                try:
+                    from app.models import Conversation as ConversationDB
+                    from app.models import Memory as MemoryDB
+                    from app.models import Message as MessageDB
+
+                    # gunakan ORM async
+                    conv = await ConversationDB.objects.aget(id=str(conv_id))
+                    messages_payload = []
+                    # Selalu baca dari tabel Message sebagai single source of truth
+                    temp_msgs = []
+                    async for m in MessageDB.objects.filter(conversation=conv).order_by("created_at"):
+                        temp_msgs.append(m)
+                    messages_payload = [m.to_dict() for m in temp_msgs]
+
+                    if messages_payload:
+                        from app.schema import Message as SchemaMessage
+                        parsed_msgs = []
+                        for payload in messages_payload:
+                            try:
+                                parsed_msgs.append(SchemaMessage(**payload))
+                            except Exception as e:
+                                from app.logger import logger
+                                logger.error(f"Skipping unparsable message from DB: {e}")
+                        if parsed_msgs:
+                            instance.memory.add_messages(parsed_msgs)
+                except Exception as e:
+                    from app.logger import logger
+                    logger.error(f"Failed to preload conversation history: {e}")
+            except Exception as e:
+                from app.logger import logger
+                logger.error(f"Failed to attach Django persistence: {e}")
+        return instance

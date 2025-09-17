@@ -219,6 +219,18 @@
       // Optimistic append user message (akan tersimpan via API juga)
       if (text) appendMessage({ role: "user", content: text });
       msgInput.value = "";
+      // Prepare payload with images and agent type
+      const payload = { content: text };
+      
+      // Add base64 images if any
+      if (selectedImages.length > 0) {
+        // For now, just take the first image
+        payload.base64_image = selectedImages[0].dataUrl.split(',')[1]; // Remove data:image/... prefix
+      }
+      
+      // Add agent type from UI
+      payload.agent_type = agentSelect.value;
+      
       const res = await fetch(
         `/api/v1/chat/conversations/${conversationId}/messages`,
         {
@@ -228,7 +240,7 @@
             "X-CSRFToken": getCookie("csrftoken"),
           },
           credentials: "include",
-          body: JSON.stringify({ content: text }), // images belum dikirim ke backend
+          body: JSON.stringify(payload),
         }
       );
       if (!res.ok) {
@@ -236,6 +248,9 @@
         throw new Error(err.detail || err.error || "Gagal mengirim pesan");
       }
       appendInfo("Pesan dikirim. Menunggu respons agent...");
+      // Clear selected images after successful send
+      selectedImages.length = 0;
+      renderPreviews();
     } catch (e) {
       showToast(e.message);
     } finally {

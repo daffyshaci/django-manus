@@ -8,6 +8,7 @@ class BaseTool(ABC, BaseModel):
     name: str
     description: str
     parameters: Optional[dict] = None
+    agent: Optional[Any] = Field(default=None, exclude=True, description="Reference to the agent instance for context injection")
 
     class Config:
         arbitrary_types_allowed = True

@@ -226,7 +226,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
         # Primary attempt: use Daytona process.exec with cwd/timeout/env
         try:
             try:
-                resp = self.sandbox.process.exec(command, cwd=cwd, timeout=timeout, env=env)
+                resp = self.sandbox.process.exec(command, timeout=timeout)
             except TypeError:
                 # Older SDKs may not support env/cwd; try progressively with supported args
                 try:
