@@ -3,6 +3,13 @@
   <div class="row" style="align-items: center; gap: 8px">
     <div class="pill" id="status">Terhubung</div>
     <div class="muted" id="modelInfo"></div>
+    <!-- Agent selector (frontend only) -->
+    <span class="pill" id="agentPill">Agent: -</span>
+    <select id="agentSelect" class="select" style="max-width:200px">
+      <option value="manus">Manus</option>
+      <option value="data_analysis">Data Analysis</option>
+    </select>
+    <span class="muted" style="font-size:12px">(Frontend only)</span>
     <div class="grow"></div>
     <button
       class="btn"
@@ -35,6 +42,12 @@
     <input id="msg" class="input grow" placeholder="Tulis pesan..." />
     <button id="send" class="btn primary">Kirim</button>
   </div>
+  <!-- Image upload UI (frontend only) -->
+  <div class="row" style="gap:8px; align-items:center; margin-top:8px">
+    <label class="btn" for="imageInput">+ Gambar</label>
+    <input id="imageInput" type="file" accept="image/*" multiple style="display:none" />
+    <div id="imagePreview" class="row" style="gap:8px; flex-wrap: wrap"></div>
+  </div>
 </div>
 {% endblock %} {% block scripts %}
 <script>
@@ -46,6 +59,10 @@
   const thinkingEl = document.getElementById("thinking");
   const modelInfo = document.getElementById("modelInfo");
   const btnClear = document.getElementById("btnClear");
+  const agentPill = document.getElementById("agentPill");
+  const agentSelect = document.getElementById("agentSelect");
+  const imageInput = document.getElementById("imageInput");
+  const imagePreview = document.getElementById("imagePreview");
 
   const roleLabel = {
     user: "Anda",
@@ -53,6 +70,69 @@
     system: "System",
     tool: "Tool",
   };
+
+  // Helpers
+  function getQueryParam(name){
+    const u = new URL(window.location.href);
+    return u.searchParams.get(name);
+  }
+  function setAgentUI(agent){
+    agentPill.textContent = `Agent: ${agent}`;
+    if (agentSelect) agentSelect.value = agent;
+  }
+
+  // Initialize agent preference (per-conversation)
+  (function initAgent(){
+    const storageKey = `conv_agent_${conversationId}`;
+    let agent = getQueryParam('agent') || localStorage.getItem(storageKey) || localStorage.getItem('preferred_agent_type') || 'manus';
+    setAgentUI(agent);
+    try { localStorage.setItem(storageKey, agent); } catch (e) {}
+    agentSelect.addEventListener('change', () => {
+      agent = agentSelect.value;
+      setAgentUI(agent);
+      try { localStorage.setItem(storageKey, agent); } catch (e) {}
+    });
+  })();
+
+  // Image upload preview (frontend-only for now)
+  const selectedImages = [];
+  function renderPreviews(){
+    imagePreview.innerHTML = '';
+    selectedImages.forEach((item, idx) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'card';
+      wrap.style = 'position:relative; padding:4px;';
+      const img = document.createElement('img');
+      img.src = item.dataUrl;
+      img.style = 'max-width:120px; max-height:90px; display:block; border-radius:6px;';
+      const del = document.createElement('button');
+      del.textContent = '×';
+      del.className = 'btn';
+      del.style = 'position:absolute; top:4px; right:4px; padding:2px 6px;';
+      del.addEventListener('click', () => {
+        selectedImages.splice(idx,1);
+        renderPreviews();
+      });
+      wrap.appendChild(img);
+      wrap.appendChild(del);
+      imagePreview.appendChild(wrap);
+    });
+  }
+  imageInput.addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const file of files){
+      if (!file.type.startsWith('image/')) continue;
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      });
+      selectedImages.push({ file, dataUrl });
+    }
+    imageInput.value = '';
+    renderPreviews();
+  });
 
   // Indikator typing/streaming sederhana: tampilkan saat ada event thoughts/step dan sembunyikan saat finished
   function setThinking(thinking) {
@@ -93,7 +173,6 @@
   function setSendingState(sending) {
     sendBtn.disabled = sending;
     msgInput.disabled = sending;
-    // Saat mengirim pesan user, kita boleh tampilkan indikator singkat
     thinkingEl.style.display = sending ? "block" : "none";
   }
 
@@ -131,11 +210,14 @@
 
   async function sendMessage() {
     const text = msgInput.value.trim();
-    if (!text) return;
+    if (!text && selectedImages.length === 0) {
+      showToast('Tulis pesan atau pilih gambar');
+      return;
+    }
     setSendingState(true);
     try {
       // Optimistic append user message (akan tersimpan via API juga)
-      appendMessage({ role: "user", content: text });
+      if (text) appendMessage({ role: "user", content: text });
       msgInput.value = "";
       const res = await fetch(
         `/api/v1/chat/conversations/${conversationId}/messages`,
@@ -146,7 +228,7 @@
             "X-CSRFToken": getCookie("csrftoken"),
           },
           credentials: "include",
-          body: JSON.stringify({ content: text }),
+          body: JSON.stringify({ content: text }), // images belum dikirim ke backend
         }
       );
       if (!res.ok) {
@@ -253,7 +335,6 @@
         }
         break;
       default:
-        // Selain notify, pesan baru akan disimpan via ORM hook dan bisa dimuat via reload; namun kita bisa juga menampilkan live jika backend mengirim event khusus.
         break;
     }
   }

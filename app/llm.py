@@ -31,7 +31,7 @@ from app.schema import (
 )
 
 
-REASONING_MODELS = ["o1", "o3-mini"]
+REASONING_MODELS = ["gpt-5","o1", "o3-mini", "deepseek-chat", "grok-3-mini"]
 MULTIMODAL_MODELS = [
     "gpt-4-vision-preview",
     "gpt-4o",
