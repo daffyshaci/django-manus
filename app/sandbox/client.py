@@ -64,7 +64,7 @@ class BaseSandboxClient(ABC):
         """Creates sandbox."""
 
     @abstractmethod
-    async def run_command(self, command: str, timeout: Optional[int] = None) -> str:
+    async def run_command(self, command: str, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> str:
         """Executes command."""
 
     @abstractmethod
@@ -98,25 +98,52 @@ class DaytonaSandboxClient(BaseSandboxClient):
         self._conversation_id: Optional[str] = None
 
     def _map_to_workspace(self, path: str) -> str:
-        """Map host absolute path to Daytona workspace absolute path under work_dir."""
+        """Map any incoming path to a POSIX path within the sandbox work_dir.
+
+        Rules:
+        - If already starts with work_dir (e.g. '/workspace'), keep as is.
+        - If starts with '/' but not with work_dir, treat as inside work_dir (e.g. '/file.py' -> '/workspace/file.py').
+        - If it's an absolute host path (Windows/Unix), try to map relative to config.workspace_root; if not possible, place under work_dir with basename.
+        - For relative paths, treat as relative to work_dir.
+        """
         if not path:
             return path
-        # Already a POSIX-like path; normalize slashes
         p_str = str(path)
-        # If the path already starts with work_dir, keep it
-        work_dir = self._work_dir or config.sandbox.work_dir
-        if p_str.replace("\\", "/").startswith(work_dir.rstrip("/")):
-            return p_str.replace("\\", "/")
+        work_dir = (self._work_dir or (config.sandbox.work_dir if config.sandbox else "/home/daytona/workspace") or "/home/daytona/workspace").rstrip("/")
+        posix = p_str.replace("\\", "/")
+
+        # Already in sandbox workspace
+        if posix == work_dir or posix.startswith(work_dir + "/"):
+            return posix
+
+        # Legacy paths like '/workspace/...': rewrite to configured work_dir to avoid duplication
+        if posix == "/workspace" or posix.startswith("/workspace/"):
+            remainder = posix[len("/workspace"):].lstrip("/")
+            return work_dir if not remainder else f"{work_dir}/{remainder}"
+
+        # POSIX absolute but outside work_dir -> relocate into work_dir
+        if posix.startswith("/"):
+            return f"{work_dir}/{posix.lstrip('/')}"
+
+        # Host absolute paths (Windows/Unix)
         try:
             host_path = Path(p_str)
             if host_path.is_absolute():
-                rel = host_path.relative_to(config.workspace_root)
-                mapped = Path(work_dir) / Path(str(rel).replace("\\", "/"))
-                return str(mapped).replace("\\", "/")
+                ws_root_val = getattr(config, "workspace_root", None)
+                ws_root = Path(ws_root_val) if ws_root_val else None
+                if ws_root:
+                    try:
+                        rel = host_path.relative_to(ws_root)
+                        return f"{work_dir}/{rel.as_posix()}"
+                    except Exception:
+                        pass
+                # Fallback: use basename under work_dir to avoid leaking host paths
+                return f"{work_dir}/{host_path.name}"
         except Exception:
-            # If cannot map, default to assuming path is already in sandbox
-            return p_str.replace("\\", "/")
-        return p_str.replace("\\", "/")
+            pass
+
+        # Relative path -> treat as under work_dir
+        return f"{work_dir}/{posix}"
 
     async def create(
         self,
@@ -136,7 +163,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
             use_sandbox=True,
             provider="daytona",
             image="python:3.12-slim",
-            work_dir="/workspace",
+            work_dir="/home/daytona/workspace",
             memory_limit="512m",
             cpu_limit=1.0,
             timeout=300,
@@ -156,70 +183,169 @@ class DaytonaSandboxClient(BaseSandboxClient):
         # Create sandbox (use defaults per SDK quick start)
         self.sandbox = self._daytona.create()
         # Keep configured work dir for path mapping only (do not enforce as cwd)
-        self._work_dir = cfg.work_dir or "/workspace"
+        self._work_dir = cfg.work_dir or "/home/daytona/workspace"
+        # Ensure workspace directory exists inside sandbox
+        try:
+            # Try Daytona FS API first
+            res = self.sandbox.fs.create_folder(self._work_dir, "755")
+            if hasattr(res, "__await__"):
+                await res
+        except Exception:
+            # Fallback to shell mkdir/chmod
+            await self.run_command(f"mkdir -p {shlex.quote(self._work_dir)} && chmod 755 {shlex.quote(self._work_dir)}")
         # Track current conversation for potential per-conversation behavior; preserve if None
         if conversation_id is not None:
             self._conversation_id = conversation_id
 
-    async def run_command(self, command: str, timeout: Optional[int] = None) -> str:
+    async def run_command(self, command: str, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> str:
+        """Execute a shell command in the sandbox, anchored to the configured work_dir.
+
+        It uses Daytona SDK's process.exec with cwd set to the globally initialized
+        workspace directory, and includes a robust fallback that prefixes `cd <cwd> &&`.
+        """
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
+        if command is None:
+            return ""
+        cwd = (self._work_dir or (config.sandbox.work_dir if config.sandbox else "/home/daytona/workspace") or "/home/daytona/workspace")
 
-        # Prefer capturing stdout from Daytona when supported
+        # Helper: build shell exports for env when falling back
+        def _export_env_prefix(e: Optional[Dict[str, str]]) -> str:
+            if not e:
+                return ""
+            parts = []
+            for k, v in e.items():
+                # Only allow safe env var names
+                if not k or not isinstance(k, str):
+                    continue
+                if not __import__('re').match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+                    continue
+                parts.append(f"export {k}={shlex.quote(str(v))}")
+            return ("; ".join(parts) + "; ") if parts else ""
+
+        # Primary attempt: use Daytona process.exec with cwd/timeout/env
         try:
-            response = self.sandbox.process.exec(
-                command, timeout=timeout, capture_output=True
-            )
-        except TypeError:
-            # Signature without capture_output or timeout
             try:
-                response = self.sandbox.process.exec(command, timeout=timeout)
+                resp = self.sandbox.process.exec(command, cwd=cwd, timeout=timeout, env=env)
             except TypeError:
-                response = self.sandbox.process.exec(command)
-        except Exception:
-            # Minimal invocation on unexpected SDK errors
-            response = self.sandbox.process.exec(command)
-
-        # Extract stdout/result robustly
-        out = ""
-        try:
-            artifacts = getattr(response, "artifacts", None)
-            if artifacts is not None:
-                stdout_val = getattr(artifacts, "stdout", None)
-                if stdout_val:
-                    out = stdout_val
-        except Exception:
-            pass
-
-        if not out:
+                # Older SDKs may not support env/cwd; try progressively with supported args
+                try:
+                    resp = self.sandbox.process.exec(command, cwd=cwd, timeout=timeout)
+                except TypeError:
+                    resp = self.sandbox.process.exec(command, timeout=timeout)
+            if hasattr(resp, "__await__"):
+                resp = await resp
+            # Extract result from common attributes
+            result = None
             for attr in ("result", "stdout", "output"):
-                if hasattr(response, attr):
-                    val = getattr(response, attr)
-                    if val:
-                        if isinstance(val, (bytes, bytearray)):
-                            out = val.decode("utf-8", "ignore")
-                        else:
-                            out = str(val)
+                if hasattr(resp, attr):
+                    result = getattr(resp, attr)
+                    break
+            if isinstance(result, (bytes, bytearray)):
+                return result.decode("utf-8", errors="ignore")
+            if isinstance(result, str):
+                return result
+            # Fallback to stringifying response
+            return "" if resp is None else str(resp)
+        except Exception:
+            # Secondary attempt: enforce cwd/env via shell
+            try:
+                exports = _export_env_prefix(env)
+                fallback_cmd = f"{exports}cd {shlex.quote(cwd)} && {command}"
+                resp2 = self.sandbox.process.exec(fallback_cmd, timeout=timeout)
+                if hasattr(resp2, "__await__"):
+                    resp2 = await resp2
+                result2 = None
+                for attr in ("result", "stdout", "output"):
+                    if hasattr(resp2, attr):
+                        result2 = getattr(resp2, attr)
                         break
+                if isinstance(result2, (bytes, bytearray)):
+                    return result2.decode("utf-8", errors="ignore")
+                if isinstance(result2, str):
+                    return result2
+                return "" if resp2 is None else str(resp2)
+            except Exception as e2:
+                raise RuntimeError(f"Failed to execute command in sandbox (cwd={cwd}): {command}. Error: {e2}") from e2
 
-        return out or ""
+    async def code_run(self, code: str, timeout: Optional[int] = None) -> str:
+        """Run Python code directly inside the sandbox via Daytona's code_run API.
+
+        - Prefer SDK process.code_run with cwd bound to the configured work_dir when supported.
+        - Fallback to writing a temp file and executing it with python3/python via run_command.
+        """
+        if not self.sandbox:
+            raise RuntimeError("Sandbox not initialized")
+        cwd = (self._work_dir or (config.sandbox.work_dir if config.sandbox else "/home/daytona/workspace") or "/home/daytona/workspace")
+        # Primary: use SDK code_run
+        try:
+            try:
+                resp = self.sandbox.process.code_run(code, cwd=cwd, timeout=timeout)
+            except TypeError:
+                # Some SDK versions might not support cwd param for code_run
+                resp = self.sandbox.process.code_run(code, timeout=timeout)
+            if hasattr(resp, "__await__"):
+                resp = await resp
+            result = None
+            for attr in ("result", "stdout", "output"):
+                if hasattr(resp, attr):
+                    result = getattr(resp, attr)
+                    break
+            if isinstance(result, (bytes, bytearray)):
+                return result.decode("utf-8", errors="ignore")
+            if isinstance(result, str):
+                return result
+            return "" if resp is None else str(resp)
+        except Exception:
+            # Fallback: write to a temporary file and execute via python
+            import time as _time
+            work_dir = cwd.rstrip("/")
+            conv = getattr(self, "_conversation_id", None)
+            tmp_base = f"{work_dir}/.manus_tmp" if not conv else f"{work_dir}/.manus/{conv}/tmp"
+            await self.run_command(f"mkdir -p {shlex.quote(tmp_base)}")
+            filename = f"{tmp_base}/exec_{int(_time.time()*1000)}.py"
+            await self.write_file(filename, code)
+            cmd = f"python3 {filename} 2>&1 || python {filename} 2>&1"
+            return await self.run_command(cmd, timeout=timeout)
 
     async def copy_from(self, container_path: str, local_path: str) -> None:
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
         spath = self._map_to_workspace(container_path)
-        content = self.sandbox.fs.download_file(spath)
-        if hasattr(content, "__await__"):
-            content = await content
-        data = content if isinstance(content, (bytes, bytearray)) else str(content).encode("utf-8")
-        Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(local_path).write_bytes(data)
+        # Ensure local parent dir exists
+        local_p = Path(local_path)
+        local_p.parent.mkdir(parents=True, exist_ok=True)
+        # Try Daytona SDK first
+        try:
+            content = self.sandbox.fs.download_file(spath)
+            if hasattr(content, "__await__"):
+                content = await content
+            if isinstance(content, (bytes, bytearray)):
+                data = bytes(content)
+            else:
+                data = str(content).encode("utf-8")
+            local_p.write_bytes(data)
+            return
+        except Exception:
+            # Fallback via shell base64 to preserve binary content
+            try:
+                out = await self.run_command(f"base64 {shlex.quote(spath)}")
+                data = base64.b64decode(out)
+                local_p.write_bytes(data)
+                return
+            except Exception:
+                # Last resort: plain cat (may corrupt binary). Best-effort.
+                out2 = await self.run_command(f"cat {shlex.quote(spath)} || true")
+                local_p.write_text(out2, encoding="utf-8")
 
     async def copy_to(self, local_path: str, container_path: str) -> None:
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
         spath = self._map_to_workspace(container_path)
         data = Path(local_path).read_bytes()
+        # Ensure parent dir exists
+        parent_dir = "/".join(spath.split("/")[:-1]) or (self._work_dir or "/home/daytona/workspace")
+        await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
         # Handle possible SDK signature differences by trying both orders
         try:
             result = self.sandbox.fs.upload_file(data, spath)
@@ -227,6 +353,49 @@ class DaytonaSandboxClient(BaseSandboxClient):
             result = self.sandbox.fs.upload_file(spath, data)
         if hasattr(result, "__await__"):
             await result
+        # Verify upload actually created the file; if not, fallback
+        try:
+            exists_out = await self.run_command(f"test -e {shlex.quote(spath)} && echo OK || echo NO")
+            if "OK" not in (exists_out or ""):
+                # Fallback to shell-based write
+                b64 = base64.b64encode(data).decode("ascii")
+                cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
+                await self.run_command(cmd)
+        except Exception:
+            # Best-effort fallback
+            b64 = base64.b64encode(data).decode("ascii")
+            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
+            await self.run_command(cmd)
+
+    async def write_file(self, path: str, content: str) -> None:
+        if not self.sandbox:
+            raise RuntimeError("Sandbox not initialized")
+        spath = self._map_to_workspace(path)
+        # Ensure parent dir exists
+        parent_dir = "/".join(spath.split("/")[:-1]) or self._work_dir
+        await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
+        data = content.encode("utf-8")
+        print(f"write_file: {spath}")
+        # Try Daytona SDK first
+        try:
+            try:
+                result = self.sandbox.fs.upload_file(data, spath)
+            except TypeError:
+                result = self.sandbox.fs.upload_file(spath, data)
+            if hasattr(result, "__await__"):
+                await result
+            # Verify file exists; if not, fallback to shell write
+            exists_out = await self.run_command(f"test -e {shlex.quote(spath)} && echo OK || echo NO")
+            if "OK" not in (exists_out or ""):
+                b64 = base64.b64encode(data).decode("ascii")
+                cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
+                await self.run_command(cmd)
+            return
+        except Exception:
+            # Fallback: write via base64 through the shell to avoid bulk-upload endpoint issues
+            b64 = base64.b64encode(data).decode("ascii")
+            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
+            await self.run_command(cmd)
 
     async def read_file(self, path: str) -> str:
         if not self.sandbox:
@@ -241,29 +410,6 @@ class DaytonaSandboxClient(BaseSandboxClient):
             # Fallback to shell cat when SDK file API is unavailable
             out = await self.run_command(f"cat {shlex.quote(spath)} || true")
             return out
-
-    async def write_file(self, path: str, content: str) -> None:
-        if not self.sandbox:
-            raise RuntimeError("Sandbox not initialized")
-        spath = self._map_to_workspace(path)
-        # Ensure parent dir exists
-        parent_dir = "/".join(spath.split("/")[:-1]) or self._work_dir
-        await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
-        data = content.encode("utf-8")
-        # Try Daytona SDK first
-        try:
-            try:
-                result = self.sandbox.fs.upload_file(data, spath)
-            except TypeError:
-                result = self.sandbox.fs.upload_file(spath, data)
-            if hasattr(result, "__await__"):
-                await result
-            return
-        except Exception:
-            # Fallback: write via base64 through the shell to avoid bulk-upload endpoint issues
-            b64 = base64.b64encode(data).decode("ascii")
-            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
-            await self.run_command(cmd)
 
     async def cleanup(self) -> None:
         if self.sandbox and self._daytona:

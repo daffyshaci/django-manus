@@ -20,7 +20,7 @@ class DataAnalysis(ToolCallAgent):
     name: str = "Data_Analysis"
     description: str = "An analytical agent that utilizes python and data visualization tools to solve diverse data analysis tasks"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    system_prompt: str = SYSTEM_PROMPT.format(directory=config.sandbox.work_dir)
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 15000
