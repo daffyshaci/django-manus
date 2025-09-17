@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import List, Optional, Callable
 import asyncio
+import time
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -10,6 +11,7 @@ from app.logger import logger
 from app.sandbox.client import SANDBOX_CLIENT
 from app.schema import ROLE_TYPE, AgentState, Memory, Message
 from app.consumers.notifications import send_notification_async
+from app.config import config, LLMSettings
 
 
 class BaseAgent(BaseModel, ABC):
@@ -50,6 +52,12 @@ class BaseAgent(BaseModel, ABC):
         description="Django Conversation primary key to persist messages/memory to",
     )
 
+    # LLM configuration overrides
+    llm_overrides: Optional[dict] = Field(
+        default=None,
+        description="Optional LLM configuration overrides (model, temperature, etc.)",
+    )
+
     # Optional persistence hook: (agent, role, content, base64_image, kwargs_dict) -> None | awaitable
     persist_message_hook: Optional[Callable[["BaseAgent", str, str, Optional[str], dict], None]] = Field(  # type: ignore
         default=None,
@@ -77,10 +85,47 @@ class BaseAgent(BaseModel, ABC):
     @model_validator(mode="after")
     def initialize_agent(self) -> "BaseAgent":
         """Initialize agent with default settings if not provided."""
-        if self.llm is None or not isinstance(self.llm, LLM):
+        # Always prioritize llm_overrides, even if a default LLM instance already exists
+        if self.llm_overrides:
+            # Generate unique config name based on conversation_id or agent name + timestamp
+            unique_suffix = f"_{self.conversation_id}" if self.conversation_id else f"_{int(time.time())}"
+            config_name = f"{self.name.lower()}{unique_suffix}"
+            logger.info(
+                f"Initializing LLM with overrides for conversation {self.conversation_id}, config_name: {config_name}"
+            )
+            logger.debug(f"LLM overrides: {self.llm_overrides}")
+            # Merge overrides with base config and build a proper mapping for LLM
+            try:
+                base_map = config.llm  # Dict[str, LLMSettings]
+                base_cfg = base_map.get(self.name.lower(), base_map["default"])  # type: ignore[index]
+                base_data = (
+                    base_cfg.model_dump() if hasattr(base_cfg, "model_dump") else base_cfg.dict()
+                )
+                merged_data = {**base_data, **(self.llm_overrides or {})}
+                merged_cfg = LLMSettings(**merged_data)
+                # Provide mapping with default and our unique config_name
+                llm_map = {"default": base_cfg, config_name: merged_cfg}
+                self.llm = LLM(config_name=config_name, llm_config=llm_map)  # type: ignore[arg-type]
+                logger.info("LLM initialized successfully with overrides")
+            except Exception as e:
+                logger.exception(
+                    f"Failed to apply llm_overrides, falling back to default config: {e}"
+                )
+                self.llm = LLM(config_name=self.name.lower())
+        elif self.llm is None or not isinstance(self.llm, LLM):
+            logger.info(f"Initializing LLM with default config: {self.name.lower()}")
             self.llm = LLM(config_name=self.name.lower())
+            logger.info("LLM initialized successfully with default config")
+        else:
+            logger.debug(f"LLM already initialized: {type(self.llm)}")
+
         if not isinstance(self.memory, Memory):
+            logger.debug("Initializing memory")
             self.memory = Memory()
+            logger.debug("Memory initialized successfully")
+        else:
+            logger.debug("Memory already initialized")
+
         return self
 
     @asynccontextmanager
@@ -297,19 +342,46 @@ class BaseAgent(BaseModel, ABC):
                 from app.models import Conversation as ConversationDB
                 from app.models import FileArtifact
                 from django.utils import timezone as _tz
+                import hashlib
 
                 conv = await sync_to_async(ConversationDB.objects.get)(id=agent.conversation_id)
                 for it in items:
                     path = (it.get("path") or "").strip()
                     if not path:
                         continue
+                    
                     filename = (it.get("filename") or path.split("/")[-1]).strip()
+                    
+                    # Read file content from sandbox if not provided
+                    stored_content = it.get("stored_content") or ""
+                    size_bytes = it.get("size_bytes") or 0
+                    sha256 = it.get("sha256") or ""
+                    
+                    # If content not provided, read from sandbox
+                    if not stored_content and not size_bytes:
+                        try:
+                            # Read file content from sandbox
+                            file_content = await SANDBOX_CLIENT.read_file(path)
+                            stored_content = file_content
+                            size_bytes = len(file_content.encode('utf-8'))
+                            
+                            # Calculate SHA256 hash
+                            sha256_hash = hashlib.sha256()
+                            sha256_hash.update(file_content.encode('utf-8'))
+                            sha256 = sha256_hash.hexdigest()
+                        except Exception as read_error:
+                            logger.warning(f"Failed to read file {path} from sandbox: {read_error}")
+                            # Continue with metadata only if file doesn't exist or can't be read
+                            stored_content = ""
+                            size_bytes = 0
+                            sha256 = ""
+                    
                     defaults = {
                         "filename": filename,
-                        "size_bytes": it.get("size_bytes") or 0,
-                        "sha256": it.get("sha256") or "",
+                        "size_bytes": size_bytes,
+                        "sha256": sha256,
                         "mime_type": it.get("mime_type") or "",
-                        "stored_content": it.get("stored_content") or "",
+                        "stored_content": stored_content,
                         "updated_at": _tz.now(),
                     }
                     # Update if exists for same conversation+path, else create
@@ -394,6 +466,10 @@ class BaseAgent(BaseModel, ABC):
                 finally:
                     self.pending_persist_tasks.clear()
         await SANDBOX_CLIENT.cleanup()
+        
+        # Clean up tool messages to reduce context size
+        await self._cleanup_tool_messages()
+        
         return "\n".join(results) if results else "No steps executed"
 
     @abstractmethod
@@ -448,4 +524,89 @@ class BaseAgent(BaseModel, ABC):
     def messages(self, value: List[Message]):
         """Set the list of messages in the agent's memory."""
         self.memory.messages = value
+
+    async def _cleanup_tool_messages(self) -> None:
+        """Clean up tool messages to reduce context size for subsequent runs.
+        
+        This method compresses or removes content from tool messages that tend to be
+        very large (like read, web_search results) while preserving metadata.
+        """
+        if not self.memory.messages or not self.conversation_id:
+            logger.debug("No messages or conversation_id, skipping tool message cleanup")
+            return
+        
+        try:
+            from asgiref.sync import sync_to_async
+            from app.models import Conversation as ConversationDB
+            from django.utils import timezone as _tz
+            
+            # Get the conversation from database
+            conv = await sync_to_async(ConversationDB.objects.get)(id=self.conversation_id)
+            
+            # Find tool messages that need cleanup
+            tool_messages_to_clean = []
+            for msg in self.memory.messages:
+                if (msg.role == "tool" and 
+                    hasattr(msg, 'name') and 
+                    msg.name and 
+                    msg.name.lower() in ['read', 'web_search'] and
+                    hasattr(msg, 'content') and 
+                    len(msg.content or '') > 1000):  # Only clean large messages
+                    tool_messages_to_clean.append(msg)
+            
+            if not tool_messages_to_clean:
+                logger.debug("No large tool messages found for cleanup")
+                return
+            
+            logger.info(f"Cleaning up {len(tool_messages_to_clean)} tool messages for conversation {self.conversation_id}")
+            
+            # Clean each tool message
+            for msg in tool_messages_to_clean:
+                original_length = len(msg.content or '')
+                
+                if msg.name.lower() == 'read':
+                    # For read operations, keep first few lines and summary
+                    lines = msg.content.split('\n')
+                    if len(lines) > 10:
+                        msg.content = '\n'.join(lines[:5]) + '\n...\n[Content truncated for brevity]'
+                        logger.debug(f"Truncated read message from {len(lines)} lines to 5 lines")
+                elif msg.name.lower() == 'web_search':
+                    # For web search, keep only metadata and first result
+                    if 'Search results:' in msg.content:
+                        # Extract just the first result summary
+                        lines = msg.content.split('\n')
+                        truncated_content = []
+                        result_count = 0
+                        for line in lines:
+                            if line.startswith('- '):
+                                result_count += 1
+                                if result_count <= 2:  # Keep first 2 results
+                                    truncated_content.append(line)
+                            elif not line.startswith('Search results:'):
+                                truncated_content.append(line)
+                        if result_count > 2:
+                            truncated_content.append(f'... and {result_count - 2} more results')
+                        msg.content = '\n'.join(truncated_content)
+                        logger.debug(f"Truncated web_search message from {result_count} results to 2 results")
+                
+                new_length = len(msg.content or '')
+                logger.info(f"Cleaned {msg.name} message: {original_length} -> {new_length} chars (reduction: {original_length - new_length} chars)")
+                
+                # Update the message in database via persistence hook
+                if self.persist_message_hook:
+                    try:
+                        await self.persist_message_hook(
+                            self, 
+                            "tool", 
+                            msg.content, 
+                            None, 
+                            {"name": msg.name, "tool_call_id": getattr(msg, 'tool_call_id', None)}
+                        )
+                        logger.debug(f"Successfully persisted cleaned {msg.name} message")
+                    except Exception as e:
+                        logger.error(f"Failed to persist cleaned tool message: {e}")
+                        
+        except Exception as e:
+            logger.error(f"Error in tool message cleanup: {e}")
+            logger.exception("Detailed error in tool message cleanup:")
 

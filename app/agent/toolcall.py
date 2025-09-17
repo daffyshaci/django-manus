@@ -85,7 +85,7 @@ class ToolCallAgent(ReActAgent):
         content = response.content if response and response.content else ""
 
         # Log response info
-        logger.info(f"✨ {self.name}'s thoughts: {content}")
+        logger.info(f"agent thinking done")
         if self.conversation_id:
             await send_notification_async(
                 str(self.conversation_id),
@@ -95,12 +95,7 @@ class ToolCallAgent(ReActAgent):
         logger.info(
             f"🛠️ {self.name} selected {len(tool_calls) if tool_calls else 0} tools to use"
         )
-        if self.conversation_id:
-            await send_notification_async(
-                str(self.conversation_id),
-                "agent.tools_selected",
-                {"count": len(tool_calls) if tool_calls else 0},
-            )
+
         if tool_calls:
             logger.info(
                 f"🧰 Tools being prepared: {[call.function.name for call in tool_calls]}"
@@ -191,7 +186,7 @@ class ToolCallAgent(ReActAgent):
                 result = result[: self.max_observe]
 
             logger.info(
-                f"🎯 Tool '{command.function.name}' completed its mission! Result: {result}"
+                f"🎯 Tool '{command.function.name}' SUCCESS!"
             )
 
             # If this is a special tool (e.g., ask_human), persist an assistant-facing message

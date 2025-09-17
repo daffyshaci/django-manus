@@ -6,11 +6,12 @@ from typing import Any, Dict, Optional
 from celery import shared_task  # type: ignore
 
 from app.agent.manus import Manus
+from app.agent.data_analysis import DataAnalysis
 from app.logger import logger
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
-def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, agent_kwargs: Optional[Dict[str, Any]] = None) -> str:
+def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, agent_kwargs: Optional[Dict[str, Any]] = None, agent_type: Optional[str] = None, llm_overrides: Optional[Dict[str, Any]] = None) -> str:
     """
     Jalankan Manus agent sebagai Celery task.
 
@@ -35,11 +36,22 @@ def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, ag
     kwargs: Dict[str, Any] = dict(agent_kwargs or {})
     if conversation_id and "conversation_id" not in kwargs:
         kwargs["conversation_id"] = str(conversation_id)
+    
+    # Tambahkan agent_type dan llm_overrides jika tersedia
+    if agent_type and "agent_type" not in kwargs:
+        kwargs["agent_type"] = agent_type
+    if llm_overrides and "llm_overrides" not in kwargs:
+        kwargs["llm_overrides"] = llm_overrides
 
     async def _run() -> str:
-        agent = await Manus.create(**kwargs)
+        # Pilih agent berdasarkan agent_type
+        agent_class = Manus  # default
+        if agent_type == "data_analysis":
+            agent_class = DataAnalysis
+        
+        agent = await agent_class.create(**kwargs)
         try:
-            logger.warning("Processing your request via Manus agent (Celery task)...")
+            logger.warning(f"Processing your request via {agent_class.__name__} agent (Celery task)...")
             # Jika conversation_id tersedia, history (termasuk pesan user terbaru) sudah dimuat,
             # jadi jangan duplikasi dengan mengirim prompt lagi.
             if conversation_id:

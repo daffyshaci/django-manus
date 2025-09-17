@@ -6,8 +6,17 @@
       <div class="grow">
         <label class="muted">Model</label>
         <select class="select" id="model">
-          <option value="gpt-4o">gpt-4o</option>
-          <option value="gpt-4o-mini">gpt-4o-mini</option>
+          <option value="qwen3-32b">qwen3-32b</option>
+          <option value="gpt-5-mini">gpt-5-mini</option>
+          <option value="deepseek-chat">deepseek-chat</option>
+          <option value="kimi-k2">kimi-k2</option>
+        </select>
+      </div>
+      <div class="grow">
+        <label class="muted">Agent</label>
+        <select class="select" id="agent">
+          <option value="manus">Manus</option>
+          <option value="data_analysis">Data Analysis</option>
         </select>
       </div>
     </div>
@@ -48,7 +57,15 @@
   const conversationsDiv = document.getElementById("conversations");
   const promptEl = document.getElementById("prompt");
   const modelEl = document.getElementById("model");
+  const agentEl = document.getElementById("agent");
   const btnRefresh = document.getElementById("btnRefresh");
+
+  // Preselect agent from localStorage
+  try {
+    const preferredAgent =
+      localStorage.getItem("preferred_agent_type") || "manus";
+    if (agentEl) agentEl.value = preferredAgent;
+  } catch (e) {}
 
   async function fetchConversations() {
     conversationsDiv.textContent = "Memuat...";
@@ -86,6 +103,7 @@
   btn.addEventListener("click", async () => {
     const prompt = promptEl.value.trim();
     const model = modelEl.value;
+    const agent = agentEl ? agentEl.value : "manus";
     if (!prompt) {
       showToast("Tulis pesan terlebih dahulu");
       return;
@@ -101,15 +119,21 @@
           "X-CSRFToken": getCookie("csrftoken"),
         },
         credentials: "include",
-        body: JSON.stringify({ model, content: prompt }),
+        body: JSON.stringify({ model, content: prompt, agent_type: agent }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: "Gagal" }));
         throw new Error(err.detail || err.error || "Gagal membuat");
       }
       const conv = await res.json();
-      // redirect ke detail
-      window.location.href = `/chat/${conv.id}/`;
+      // Simpan preferensi agent global dan redirect dengan query param agent
+      try {
+        localStorage.setItem("preferred_agent_type", agent);
+      } catch (e) {}
+      // redirect ke detail dengan agent sebagai query param (frontend-only untuk saat ini)
+      window.location.href = `/chat/${conv.id}/?agent=${encodeURIComponent(
+        agent
+      )}`;
     } catch (e) {
       hint.textContent = e.message;
       showToast(e.message);

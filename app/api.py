@@ -2,7 +2,7 @@ from ninja import Router
 # from ninja.files import UploadedFile  # removed unused import
 from ninja.security import django_auth
 
-from .models import Conversation, Message
+from .models import Conversation, Message, FileArtifact
 from ninja import Schema, ModelSchema
 from typing import List, Optional, Protocol,Any, TYPE_CHECKING
 from uuid import UUID
@@ -11,6 +11,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import IntegrityError
 from common.auth import AsyncSessionAuth
+from .logger import logger
 
 if TYPE_CHECKING:
     from users.models import User
@@ -28,6 +29,8 @@ class ConversationSchema(ModelSchema):
 class ConversationCreateSchema(Schema):
     model: str
     content: str
+    agent_type: Optional[str] = None
+    llm_overrides: Optional[dict] = None
     # attachments: Optional[List[UUID]] = None  # List of attachment IDs
 
 
@@ -45,8 +48,15 @@ class MessageSchema(Schema):
 
 class MessageCreateSchema(Schema):
     content: str
+    base64_image: Optional[str] = None
     attachments: Optional[List[UUID]] = None  # List of attachment IDs
     metadata: Optional[dict] = None  # accepted but not persisted currently
+
+
+class FileArtifactSchema(ModelSchema):
+    class Meta:
+        model = FileArtifact
+        fields = ['id', 'path', 'filename', 'size_bytes', 'sha256', 'mime_type', 'stored_content', 'created_at', 'updated_at']
 
 
 class ConversationDetailSchema(Schema):
@@ -64,12 +74,16 @@ class AuthenticatedRequest(Protocol):
 )
 async def get_conversations(request) -> list[Conversation] | JsonResponse:
     try:
+        logger.info(f"Retrieving conversations for user {request.auth.id}")
         queryset = [
             conv
             async for conv in Conversation.objects.filter(user=request.auth)
         ]
+        logger.info(f"Retrieved {len(queryset)} conversations for user {request.auth.id}")
         return queryset
     except Exception as e:
+        logger.error(f"Failed to retrieve conversations for user {request.auth.id}: {e}")
+        logger.exception("Detailed error in get_conversations:")
         return JsonResponse({"error": "Failed to retrieve conversations", "detail": str(e)}, status=500)
 
 
@@ -81,10 +95,16 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
     Create a new conversation with an initial message and optional file attachments.
     """
     try:
+        logger.info(f"Creating conversation for user {request.auth.id}, agent_type: {data.agent_type}")
+        logger.debug(f"LLM overrides: {data.llm_overrides}")
+        
         # create conversation
         conversation = await Conversation.objects.acreate(
             user=request.auth,
+            title=data.content[:50],
             llm_model=data.model,  # map API field to model field
+            agent_type=data.agent_type,
+            llm_overrides=data.llm_overrides or {}
         )
 
         # create the initial message
@@ -94,12 +114,17 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
             content=data.content,
         )
 
+        logger.info(f"Conversation created successfully: {conversation.id}")
         return conversation
     except IntegrityError as e:
+        logger.error(f"Database integrity error creating conversation: {e}")
         return JsonResponse({"error": "Database integrity error", "detail": str(e)}, status=400)
     except ValidationError as e:
+        logger.error(f"Validation error creating conversation: {e}")
         return JsonResponse({"error": "Validation error", "detail": str(e)}, status=400)
     except Exception as e:
+        logger.error(f"Failed to create conversation for user {request.auth.id}: {e}")
+        logger.exception("Detailed error in create_conversation:")
         return JsonResponse({"error": "Failed to create conversation", "detail": str(e)}, status=500)
 
 
@@ -177,11 +202,17 @@ async def send_message(request: AuthenticatedRequest, conversation_id: UUID, dat
             conversation=conversation,
             role=Message.ROLE.USER,
             content=data.content,
+            base64_image=data.base64_image,
         )
 
         # process celery task here
         from .tasks import run_manus_agent
-        run_manus_agent.delay(data.content, str(conversation_id))
+        run_manus_agent.delay(
+            data.content, 
+            str(conversation_id),
+            agent_type=conversation.agent_type,
+            llm_overrides=conversation.llm_overrides
+        )
         return {
             "message": "Message sent successfully",
             "message_id": str(message.id),
@@ -221,7 +252,12 @@ async def trigger_first_message(request: AuthenticatedRequest, conversation_id: 
             break
 
         from .tasks import run_manus_agent
-        run_manus_agent.delay(prompt or "", str(conversation_id))
+        run_manus_agent.delay(
+            prompt or "", 
+            str(conversation_id),
+            agent_type=conversation.agent_type,
+            llm_overrides=conversation.llm_overrides
+        )
 
         return {
             "message": "First message processing triggered",
@@ -232,3 +268,39 @@ async def trigger_first_message(request: AuthenticatedRequest, conversation_id: 
         return JsonResponse({"error": "Conversation not found"}, status=404)
     except Exception as e:
         return JsonResponse({"error": "Failed to trigger first message processing", "detail": str(e)}, status=500)
+
+
+@router.get(
+    "/conversations/{conversation_id}/files",
+    response=list[FileArtifactSchema],
+    auth=AsyncSessionAuth()
+)
+async def get_conversation_files(request: AuthenticatedRequest, conversation_id: UUID) -> list[FileArtifact] | JsonResponse:
+    """
+    Get all file artifacts for a conversation.
+    This endpoint returns files produced/used during the conversation.
+    """
+    try:
+        # Verify conversation exists and belongs to user
+        conversation = await Conversation.objects.aget(
+            id=conversation_id, user=request.auth
+        )
+        logger.info(f"Retrieving files for conversation {conversation_id}")
+
+        # Get all file artifacts for this conversation
+        files = []
+        async for file_artifact in FileArtifact.objects.filter(conversation=conversation).order_by('-created_at'):
+            files.append(file_artifact)
+
+        logger.info(f"Retrieved {len(files)} files for conversation {conversation_id}")
+        if files:
+            logger.debug(f"File details: {[{'id': str(f.id), 'path': f.path, 'size': f.size_bytes} for f in files]}")
+        
+        return files
+    except ObjectDoesNotExist:
+        logger.warning(f"Conversation not found: {conversation_id}")
+        return JsonResponse({"error": "Conversation not found"}, status=404)
+    except Exception as e:
+        logger.error(f"Failed to retrieve conversation files for {conversation_id}: {e}")
+        logger.exception("Detailed error in get_conversation_files:")
+        return JsonResponse({"error": "Failed to retrieve conversation files", "detail": str(e)}, status=500)
