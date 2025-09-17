@@ -226,7 +226,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
         # Primary attempt: use Daytona process.exec with cwd/timeout/env
         try:
             try:
-                resp = self.sandbox.process.exec(command, timeout=timeout)
+                resp = self.sandbox.process.exec(command, cwd=cwd, timeout=timeout)
             except TypeError:
                 # Older SDKs may not support env/cwd; try progressively with supported args
                 try:
@@ -280,7 +280,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
         # Primary: use SDK code_run
         try:
             try:
-                resp = self.sandbox.process.code_run(code, cwd=cwd, timeout=timeout)
+                resp = self.sandbox.process.code_run(code, timeout=timeout)
             except TypeError:
                 # Some SDK versions might not support cwd param for code_run
                 resp = self.sandbox.process.code_run(code, timeout=timeout)
@@ -375,7 +375,6 @@ class DaytonaSandboxClient(BaseSandboxClient):
         parent_dir = "/".join(spath.split("/")[:-1]) or self._work_dir
         await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
         data = content.encode("utf-8")
-        print(f"write_file: {spath}")
         # Try Daytona SDK first
         try:
             try:

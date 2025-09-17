@@ -44,48 +44,54 @@ class SandboxFileOperator(FileOperator):
         """Map user-provided path to sandbox workspace POSIX path when needed.
 
         Rules:
-        - Always canonicalize to '/workspace' inside the sandbox to avoid leaking host paths.
-        - If path already starts with '/workspace', keep as is.
-        - If path starts with '/' but NOT with '/workspace', interpret it as inside '/workspace'.
-        - If path is an absolute HOST path under config.workspace_root, remap to '/workspace/<relative>'.
-        - If path is an absolute HOST path outside workspace_root, place under '/workspace/<basename>'.
-        - Otherwise, treat as relative and place under '/workspace/<path>'.
+        - Always canonicalize to the actual sandbox work_dir (default '/home/daytona/workspace').
+        - Legacy '/workspace' paths are rewritten to the configured work_dir.
+        - If path already starts with work_dir, keep as is.
+        - If path starts with '/' but NOT with work_dir, interpret it as inside work_dir.
+        - If path is an absolute HOST path under config.workspace_root, remap to 'work_dir/<relative>'.
+        - If path is an absolute HOST path outside workspace_root, place under 'work_dir/<basename>'.
+        - Otherwise, treat as relative and place under 'work_dir/<path>'.
         """
         p_str = str(path)
         posix = p_str.replace("\\", "/")
-        canonical = "/workspace"
         work_dir = (
-            (config.sandbox.work_dir if config.sandbox else canonical).replace("\\", "/").rstrip("/")
+            (config.sandbox.work_dir if config.sandbox else "/home/daytona/workspace")
+            .replace("\\", "/")
+            .rstrip("/")
         )
 
-        # Already in canonical sandbox workspace
-        if posix == canonical or posix.startswith(canonical + "/"):
+        # Already in sandbox work_dir
+        if posix == work_dir or posix.startswith(work_dir + "/"):
             return posix
 
-        # Paths under configured work_dir (host-style or posix) -> map to canonical
-        if posix == work_dir or posix.startswith(work_dir + "/"):
-            remainder = posix[len(work_dir):].lstrip("/")
-            return canonical if not remainder else f"{canonical}/{remainder}"
+        # Legacy canonical '/workspace' -> rewrite to configured work_dir
+        if posix == "/workspace" or posix.startswith("/workspace/"):
+            remainder = posix[len("/workspace"):].lstrip("/")
+            return work_dir if not remainder else f"{work_dir}/{remainder}"
 
-        # Any other absolute posix path -> treat as inside canonical workspace
+        # Any other absolute posix path -> treat as inside work_dir
         if posix.startswith("/"):
-            return f"{canonical}/{posix.lstrip('/')}"
+            return f"{work_dir}/{posix.lstrip('/')}"
 
-        # Absolute host paths -> map under canonical workspace
+        # Absolute host paths -> map under work_dir
         try:
             p = Path(p_str)
             if p.is_absolute():
                 ws_root = Path(config.workspace_root) if getattr(config, "workspace_root", None) else None
                 if ws_root and str(p).startswith(str(ws_root)):
                     rel = p.relative_to(ws_root)
-                    return f"{canonical}/{rel.as_posix()}"
-                return f"{canonical}/{p.name}"
+                    return f"{work_dir}/{rel.as_posix()}"
+                return f"{work_dir}/{p.name}"
         except Exception:
             # fall through to treat as relative
             pass
 
-        # Relative path -> under canonical workspace
-        return f"{canonical}/{posix}"
+        # Relative path -> under work_dir
+        return f"{work_dir}/{posix}"
+
+    # Public helper to obtain the sanitized sandbox path
+    def to_sandbox_path(self, path: PathLike) -> str:
+        return self._to_sandbox_path(path)
 
     async def _ensure_sandbox_initialized(self) -> None:
         """Ensure sandbox is initialized before performing operations."""

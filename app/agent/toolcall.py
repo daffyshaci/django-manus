@@ -164,7 +164,7 @@ class ToolCallAgent(ReActAgent):
             # Internal guidance to push model to terminate if final (do not persist)
             self.update_memory(
                 role="user",
-                content="The LLM does not call any tool. Consider whether the last response is the final answer. If it is, invoke the `terminate` tool.",
+                content="The LLM does not call any tool. Consider whether the last response is the final answer. If it is, invoke the `terminate` tool and DO NOT return any text response. just call the tool.",
                 persist=False,
             )
             if self.conversation_id:

@@ -70,7 +70,7 @@ class StrReplaceEditor(BaseTool):
                 "type": "string",
             },
             "path": {
-                "description": "Sandbox path (POSIX). Use '/workspace/...' or shorthand '/file.py' to refer to '/workspace/file.py'. Do NOT use host OS paths like 'C:\\...'.",
+                "description": "Sandbox path (POSIX). Use '/file.py' or '/workspace/...' to refer to files under the sandbox work_dir. All paths are sanitized to the actual work_dir (default '/home/daytona/workspace'). Do NOT use host OS paths like 'C:\\...'.",
                 "type": "string",
             },
             "file_text": {
@@ -122,7 +122,7 @@ class StrReplaceEditor(BaseTool):
         operator = self._get_operator()
 
         # Validate path and command combination
-        await self.validate_path(command, Path(path), operator)
+        # await self.validate_path(command, Path(path), operator)
 
         # Execute the appropriate command
         if command == "view":
@@ -217,13 +217,19 @@ class StrReplaceEditor(BaseTool):
     @staticmethod
     async def _view_directory(path: PathLike, operator: SandboxFileOperator) -> CLIResult:
         """Display directory contents."""
-        find_cmd = f"find {path} -maxdepth 2 -not -path '*/\\.*'"
+        spath = (
+            operator.to_sandbox_path(path)
+            if hasattr(operator, "to_sandbox_path")
+            else str(path).replace("\\", "/")
+        )
+        find_cmd = f"find {spath} -maxdepth 2 -not -path '*/\\.*'"
 
         # Execute command using the operator
         returncode, stdout, stderr = await operator.run_command(find_cmd)
 
         if not stderr:
             stdout = (
+                f"Here's the files and directories up to 2 levels deep in {spath}, "
                 f"Here's the files and directories up to 2 levels deep in {path}, "
                 f"excluding hidden items:\n{stdout}\n"
             )

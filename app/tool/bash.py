@@ -8,6 +8,7 @@ from app.sandbox.client import SANDBOX_CLIENT
 
 
 _BASH_DESCRIPTION = """Execute a bash command in the sandboxed terminal.
+* Working Directory: you are currently in the `/workspace` directory, if you need to run file, do not add /workspace in your command (e.g `python3 app.py` instead of `/workspace/app.py`).
 * Long running commands: For commands that may run indefinitely, run them in the background and redirect output to a file, e.g. `python3 app.py > server.log 2>&1 &`.
 * Interactive: If a command returns exit code `-1`, send a second call with empty `command` to retrieve additional logs, or send input text to STDIN by setting `command` to the text.
 * Timeout: If a command execution result says "Command timed out.", retry running the command in the background.

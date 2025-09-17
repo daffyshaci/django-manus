@@ -98,13 +98,18 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
         logger.info(f"Creating conversation for user {request.auth.id}, agent_type: {data.agent_type}")
         logger.debug(f"LLM overrides: {data.llm_overrides}")
         
+        # Merge overrides with selected model so agent respects conversation model when overrides are empty
+        overrides = dict(data.llm_overrides or {})
+        if data.model and "model" not in overrides:
+            overrides["model"] = data.model
+        
         # create conversation
         conversation = await Conversation.objects.acreate(
             user=request.auth,
             title=data.content[:50],
             llm_model=data.model,  # map API field to model field
             agent_type=data.agent_type,
-            llm_overrides=data.llm_overrides or {}
+            llm_overrides=overrides
         )
 
         # create the initial message
@@ -205,13 +210,18 @@ async def send_message(request: AuthenticatedRequest, conversation_id: UUID, dat
             base64_image=data.base64_image,
         )
 
+        # Prepare llm_overrides ensuring conversation's llm_model is respected
+        overrides = dict(conversation.llm_overrides or {})
+        if conversation.llm_model and "model" not in overrides:
+            overrides["model"] = conversation.llm_model
+
         # process celery task here
         from .tasks import run_manus_agent
         run_manus_agent.delay(
             data.content, 
             str(conversation_id),
             agent_type=conversation.agent_type,
-            llm_overrides=conversation.llm_overrides
+            llm_overrides=overrides
         )
         return {
             "message": "Message sent successfully",
@@ -251,12 +261,17 @@ async def trigger_first_message(request: AuthenticatedRequest, conversation_id: 
             prompt = msg.content
             break
 
+        # Prepare llm_overrides ensuring conversation's llm_model is respected
+        overrides = dict(conversation.llm_overrides or {})
+        if conversation.llm_model and "model" not in overrides:
+            overrides["model"] = conversation.llm_model
+
         from .tasks import run_manus_agent
         run_manus_agent.delay(
             prompt or "", 
             str(conversation_id),
             agent_type=conversation.agent_type,
-            llm_overrides=conversation.llm_overrides
+            llm_overrides=overrides
         )
 
         return {
