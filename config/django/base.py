@@ -9,7 +9,7 @@ env.read_env(os.path.join(BASE_DIR, '.env'))
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = env('SECRET_KEY')
+SECRET_KEY = env('SECRET_KEY', default='test-secret-key')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env.bool('DEBUG', False)
@@ -125,6 +125,43 @@ LOGOUT_REDIRECT_URL = '/'
 
 CORS_URLS_REGEX = r'^/api/.*$'
 
+# Allow CORS from local Next.js dev servers
+try:
+    from config.env import env as _env
+except Exception:  # pragma: no cover
+    _env = None  # type: ignore
+
+CORS_ALLOWED_ORIGINS = (
+    _env.list('CORS_ALLOWED_ORIGINS', default=[
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+    ]) if _env else [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+    ]
+)
+
+# If you rely on cookies or Authorization header across origins
+CORS_ALLOW_CREDENTIALS = True
+
+# Trusted origins for CSRF (required by Django 4+ when using cookies on cross-origin)
+CSRF_TRUSTED_ORIGINS = (
+    _env.list('CSRF_TRUSTED_ORIGINS', default=[
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+    ]) if _env else [
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost:3001',
+        'http://127.0.0.1:3001',
+    ]
+)
 LANGUAGE_CODE = 'id-id'
 
 TIME_ZONE = 'Asia/Jakarta'
@@ -183,17 +220,22 @@ from config.settings.logging import *
 from config.settings.s3 import *
 from config.settings.email import *
 
-OPENAI_API_KEY = env('OPENAI_API_KEY')
-AIMLAPI_KEY = env('AIMLAPI_KEY')
-ANTHROPIC_API_KEY = env('ANTHROPIC_API')
-MINIMAX_API_KEY = env('MINIMAX_API_KEY')
-DEEPSEEK_API_KEY = env('DEEPSEEK_API_KEY')
-GOOGLE_API_KEY = env('GOOGLE_API_KEY')
-APIFY_API_KEY = env('APIFY_API_KEY')
-REPLICATE_API_KEY = env('REPLICATE_API_KEY')
-SERPER_API_KEY = env('SERPER_API_KEY')
-BRAVE_API_KEY = env('BRAVE_API_KEY')
-LARASANA_API_BASE = env('LARASANA_API_BASE')
-LARASANA_API_KEY = env('LARASANA_API_KEY')
-DAYTONA_API_KEY = env('DAYTONA_API_KEY')
-DAYTONA_API_URL = env('DAYTONA_API_URL')
+# Provide safe defaults for API keys and external services to avoid ImproperlyConfigured during tests
+OPENAI_API_KEY = env('OPENAI_API_KEY', default='')
+AIMLAPI_KEY = env('AIMLAPI_KEY', default='')
+ANTHROPIC_API_KEY = env('ANTHROPIC_API', default='')
+MINIMAX_API_KEY = env('MINIMAX_API_KEY', default='')
+DEEPSEEK_API_KEY = env('DEEPSEEK_API_KEY', default='')
+GOOGLE_API_KEY = env('GOOGLE_API_KEY', default='')
+APIFY_API_KEY = env('APIFY_API_KEY', default='')
+REPLICATE_API_KEY = env('REPLICATE_API_KEY', default='')
+SERPER_API_KEY = env('SERPER_API_KEY', default='')
+BRAVE_API_KEY = env('BRAVE_API_KEY', default='')
+LARASANA_API_BASE = env('LARASANA_API_BASE', default='')
+LARASANA_API_KEY = env('LARASANA_API_KEY', default='')
+DAYTONA_API_KEY = env('DAYTONA_API_KEY', default='')
+DAYTONA_API_URL = env('DAYTONA_API_URL', default='')
+CLERK_JWKS_URL = env('CLERK_JWKS_URL', default=None)
+CLERK_ISSUER = env('CLERK_ISSUER', default=None)
+CLERK_AUDIENCE = env('CLERK_AUDIENCE', default=None)
+CLERK_WEBHOOK_SECRET = env('CLERK_WEBHOOK_SECRET', default=None)

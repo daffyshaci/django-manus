@@ -6,7 +6,6 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from .managers import CustomUserManager
-
  
 class User(AbstractBaseUser, PermissionsMixin):
     pkid = models.BigAutoField(primary_key=True, editable=False)
@@ -34,7 +33,32 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     @property
     def get_full_name(self):
-        return f"{self.first_name.title()} {self.last_name.title()}"
+        return f"{(self.first_name or '').title()} {(self.last_name or '').title()}".strip()
 
     def get_short_name(self):
         return self.first_name
+
+    # Ensure username and email are unique and populated when missing
+    def save(self, *args, **kwargs):
+        # Ensure unique username on create if duplicate exists
+        if not self.pk and self.username:
+            base = self.username.strip()
+            candidate = base
+            suffix = 0
+            # Exclude current pk to avoid false positives on updates
+            while self.__class__.objects.filter(username=candidate).exists():
+                suffix += 1
+                candidate = f"{base}{suffix}"
+            self.username = candidate
+
+        # Ensure email is always populated and unique, even when missing
+        if not self.email or not str(self.email).strip():
+            base = (self.username or f"user_{uuid.uuid4().hex[:8]}").strip()
+            base = base.replace("@", "_at_")
+            candidate = f"{base}@example.invalid"
+            suffix = 0
+            while self.__class__.objects.filter(email=candidate).exclude(pk=self.pk).exists():
+                suffix += 1
+                candidate = f"{base}{suffix}@example.invalid"
+            self.email = candidate.lower()
+        super().save(*args, **kwargs)

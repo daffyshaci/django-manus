@@ -88,6 +88,11 @@ class BrowserSettings(BaseModel):
     max_content_length: int = Field(
         2000, description="Maximum length for content retrieval operations"
     )
+    # Optional fields used by browser_use_tool integrations
+    engine: str = Field("playwright", description="Browser engine name")
+    new_context_config: Optional[object] = Field(
+        None, description="Optional BrowserContextConfig or equivalent"
+    )
 
 
 class SandboxSettings(BaseModel):
@@ -255,31 +260,55 @@ class Config:
             if isinstance(proxy_cfg, dict) and proxy_cfg.get("server"):
                 proxy_settings = ProxySettings(
                     server=proxy_cfg.get("server"),
-                    port=proxy_cfg.get("port", 7890),
                     username=proxy_cfg.get("username"),
                     password=proxy_cfg.get("password"),
                 )
             browser_settings = BrowserSettings(
-                engine=browser_cfg.get("engine", "playwright"),
                 headless=browser_cfg.get("headless", True),
+                disable_security=browser_cfg.get("disable_security", True),
+                extra_chromium_args=browser_cfg.get("extra_chromium_args", []),
+                chrome_instance_path=browser_cfg.get("chrome_instance_path"),
+                wss_url=browser_cfg.get("wss_url"),
+                cdp_url=browser_cfg.get("cdp_url"),
                 proxy=proxy_settings,
+                max_content_length=browser_cfg.get("max_content_length", 2000),
+                engine=browser_cfg.get("engine", "playwright"),
                 new_context_config=browser_cfg.get("new_context_config"),
             )
 
         # Search settings from Django
+        enabled_fallbacks = []
+        if dj_get("DUCKDUCKGO_ENABLED", True):
+            enabled_fallbacks.append("DuckDuckGo")
+        if dj_get("BAIDU_ENABLED", False):
+            enabled_fallbacks.append("Baidu")
+        if dj_get("BING_ENABLED", False):
+            enabled_fallbacks.append("Bing")
+        if dj_get("GOOGLE_ENABLED", False):
+            enabled_fallbacks.append("Google")
+        if dj_get("YAHOO_ENABLED", False):
+            enabled_fallbacks.append("Yahoo")
+
         search_settings = SearchSettings(
-            duckduckgo_enabled=dj_get("DUCKDUCKGO_ENABLED", True),
-            google_enabled=dj_get("GOOGLE_ENABLED", False),
-            bing_enabled=dj_get("BING_ENABLED", False),
-            yahoo_enabled=dj_get("YAHOO_ENABLED", False),
-            baidu_enabled=dj_get("BAIDU_ENABLED", False),
+            engine=dj_get("SEARCH_ENGINE", "yahoo"),
+            fallback_engines=enabled_fallbacks or ["DuckDuckGo", "Baidu", "Bing"],
+            retry_delay=dj_get("SEARCH_RETRY_DELAY", 60),
+            max_retries=dj_get("SEARCH_MAX_RETRIES", 3),
+            lang=dj_get("SEARCH_LANG", "en"),
+            country=dj_get("SEARCH_COUNTRY", "us"),
         )
 
         # Sandbox settings from Django
         sandbox_settings = SandboxSettings(
-            enabled=dj_get("SANDBOX_ENABLED", True),
+            use_sandbox=dj_get("SANDBOX_ENABLED", True),
+            provider=dj_get("SANDBOX_PROVIDER", "daytona"),
             work_dir=dj_get("SANDBOX_WORK_DIR", str(WORKSPACE_ROOT)),
-            daytona_api_key=dj_get("DAYTONA_API_KEY", None),
+            image=dj_get("SANDBOX_IMAGE", "python:3.12-slim"),
+            memory_limit=dj_get("SANDBOX_MEMORY_LIMIT", "512m"),
+            cpu_limit=float(dj_get("SANDBOX_CPU_LIMIT", 1.0)),
+            timeout=int(dj_get("SANDBOX_TIMEOUT", 300)),
+            network_enabled=bool(dj_get("SANDBOX_NETWORK_ENABLED", True)),
+            api_key=dj_get("DAYTONA_API_KEY", None),
             api_url=dj_get("DAYTONA_API_URL", None),
             target=dj_get("DAYTONA_TARGET", None),
         )

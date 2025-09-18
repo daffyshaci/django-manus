@@ -10,7 +10,7 @@ from django.http import JsonResponse
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import IntegrityError
-from common.auth import AsyncSessionAuth
+from common.auth import CombinedAuth
 from .logger import logger
 
 if TYPE_CHECKING:
@@ -70,7 +70,7 @@ class AuthenticatedRequest(Protocol):
     auth: "User"
 
 @router.get(
-    "/conversations", response=list[ConversationSchema], auth=AsyncSessionAuth()
+    "/conversations", response=list[ConversationSchema], auth=CombinedAuth()
 )
 async def get_conversations(request) -> list[Conversation] | JsonResponse:
     try:
@@ -88,7 +88,7 @@ async def get_conversations(request) -> list[Conversation] | JsonResponse:
 
 
 @router.post(
-    "/conversations", response=ConversationSchema, auth=AsyncSessionAuth()
+    "/conversations", response=ConversationSchema, auth=CombinedAuth()
 )
 async def create_conversation(request: AuthenticatedRequest, data: ConversationCreateSchema) -> Conversation | JsonResponse:
     """
@@ -119,6 +119,19 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
             content=data.content,
         )
 
+        # Start background processing immediately after creating the conversation
+        # Prepare overrides ensuring conversation's llm_model is respected
+        task_overrides = dict(overrides or {})
+        if conversation.llm_model and "model" not in task_overrides:
+            task_overrides["model"] = conversation.llm_model
+        from .tasks import run_manus_agent
+        run_manus_agent.delay(
+            data.content,
+            str(conversation.id),
+            agent_type=conversation.agent_type,
+            llm_overrides=task_overrides
+        )
+
         logger.info(f"Conversation created successfully: {conversation.id}")
         return conversation
     except IntegrityError as e:
@@ -136,7 +149,7 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
 @router.get(
     "/conversations/{conversation_id}",
     response=ConversationDetailSchema,
-    auth=AsyncSessionAuth()
+    auth=CombinedAuth()
 )
 async def get_conversation_detail(request: AuthenticatedRequest, conversation_id: UUID) -> dict[str, Any] | JsonResponse:
     """
@@ -190,7 +203,7 @@ async def get_conversation_detail(request: AuthenticatedRequest, conversation_id
 @router.post(
     "/conversations/{conversation_id}/messages",
     response=dict,
-    auth=AsyncSessionAuth()
+    auth=CombinedAuth()
 )
 async def send_message(request: AuthenticatedRequest, conversation_id: UUID, data: MessageCreateSchema) -> dict[str, Any] | JsonResponse:
     """
@@ -241,7 +254,7 @@ async def send_message(request: AuthenticatedRequest, conversation_id: UUID, dat
 @router.post(
     "/conversations/{conversation_id}/trigger-first-message",
     response=dict,
-    auth=AsyncSessionAuth()
+    auth=CombinedAuth()
 )
 async def trigger_first_message(request: AuthenticatedRequest, conversation_id: UUID) -> dict[str, Any] | JsonResponse:
     """
@@ -286,9 +299,45 @@ async def trigger_first_message(request: AuthenticatedRequest, conversation_id: 
 
 
 @router.get(
+    "/conversations/{conversation_id}/messages",
+    response=list[MessageSchema],
+    auth=CombinedAuth()
+)
+async def get_conversation_messages(request: AuthenticatedRequest, conversation_id: UUID) -> list[Message] | JsonResponse:
+    """
+    Get all messages for a conversation.
+    This endpoint returns messages produced/used during the conversation.
+    """
+    try:
+        # Verify conversation exists and belongs to user
+        conversation = await Conversation.objects.aget(
+            id=conversation_id, user=request.auth
+        )
+        logger.info(f"Retrieving messages for conversation {conversation_id}")
+
+        # Get all messages for this conversation
+        messages = []
+        async for msg in Message.objects.filter(conversation=conversation).order_by('-created_at'):
+            messages.append(msg)
+
+        logger.info(f"Retrieved {len(messages)} messages for conversation {conversation_id}")
+        if messages:
+            logger.debug(f"Message details: {[{'id': str(m.id), 'conversation_id': m.conversation.id, 'content': m.content} for m in messages]}")
+        
+        return messages
+    except ObjectDoesNotExist:
+        logger.warning(f"Conversation not found: {conversation_id}")
+        return JsonResponse({"error": "Conversation not found"}, status=404)
+    except Exception as e:
+        logger.error(f"Failed to retrieve conversation messages for {conversation_id}: {e}")
+        logger.exception("Detailed error in get_conversation_messages:")
+        return JsonResponse({"error": "Failed to retrieve conversation messages", "detail": str(e)}, status=500)
+
+
+@router.get(
     "/conversations/{conversation_id}/files",
     response=list[FileArtifactSchema],
-    auth=AsyncSessionAuth()
+    auth=CombinedAuth()
 )
 async def get_conversation_files(request: AuthenticatedRequest, conversation_id: UUID) -> list[FileArtifact] | JsonResponse:
     """
