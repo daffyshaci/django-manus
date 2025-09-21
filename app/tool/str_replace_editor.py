@@ -130,9 +130,10 @@ class StrReplaceEditor(BaseTool):
         elif command == "create":
             if file_text is None:
                 raise ToolError("Parameter `file_text` is required for command: create")
-            await operator.write_file(path, file_text)
-            self._file_history[path].append(file_text)
-            result = ToolResult(output=f"File created successfully at: {path}")
+            # await operator.write_file(path, file_text)
+            # self._file_history[path].append(file_text)
+            # result = ToolResult(output=f"File created successfully at: {path}")
+            result = await self.create(path, file_text, operator)
         elif command == "str_replace":
             if old_str is None:
                 raise ToolError(
@@ -286,6 +287,34 @@ class StrReplaceEditor(BaseTool):
             output=self._make_output(file_content, str(path), init_line=init_line)
         )
 
+    async def create(
+        self,
+        path: PathLike,
+        text_file: str,
+        operator: SandboxFileOperator = None,
+    ) -> CLIResult:
+        """Create a file at the specified path."""
+        # Check if file already exists
+        # exists = await operator.exists(path)
+        # if exists:
+        #     raise ToolError(f"File already exists at: {path}. Cannot create files that already exist.")
+
+        # Create the file
+        await operator.write_file(path, text_file)
+
+        # Save the original content to history
+        self._file_history[path].append(text_file)
+
+        # Update agent files if agent context is available
+        try:
+            if hasattr(self, 'agent') and self.agent is not None:
+                files = [{'path': str(path), 'content': str(text_file)}]
+                self.agent.update_files(files)
+        except:
+            pass
+
+        return ToolResult(output=f"File created successfully at: {path}")
+
     async def str_replace(
         self,
         path: PathLike,
@@ -328,8 +357,12 @@ class StrReplaceEditor(BaseTool):
         self._file_history[path].append(file_content)
 
         # Update agent files if agent context is available
-        if hasattr(self, 'agent') and self.agent is not None:
-            await self.agent.update_files()
+        try:
+            if hasattr(self, 'agent') and self.agent is not None:
+                files = [{'path': str(path), 'content': str(new_file_content)}]
+                self.agent.update_files(files)
+        except:
+            pass
 
         # Create a snippet of the edited section
         replacement_line = file_content.split(old_str)[0].count("\n")
@@ -390,8 +423,13 @@ class StrReplaceEditor(BaseTool):
         self._file_history[path].append(file_text)
 
         # Update agent files if agent context is available
-        if hasattr(self, 'agent') and self.agent is not None:
-            await self.agent.update_files()
+        try:
+            if hasattr(self, 'agent') and self.agent is not None:
+                self.agent.update_files(
+                    [{'path': str(path), 'content': str(new_file_text)}]
+                )
+        except:
+            pass
 
         # Prepare success message
         success_msg = f"The file {path} has been edited. "
@@ -415,8 +453,13 @@ class StrReplaceEditor(BaseTool):
         await operator.write_file(path, old_text)
 
         # Update agent files if agent context is available
-        if hasattr(self, 'agent') and self.agent is not None:
-            await self.agent.update_files()
+        try:
+            if hasattr(self, 'agent') and self.agent is not None:
+                self.agent.update_files(
+                    [{'path': str(path), 'content': str(old_text)}]
+                )
+        except:
+            pass
 
         return CLIResult(
             output=f"Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}"

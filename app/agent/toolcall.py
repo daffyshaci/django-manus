@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Union, Tuple
 
 from pydantic import Field
 
@@ -45,6 +45,13 @@ class ToolCallAgent(ReActAgent):
             self.update_memory("user", self.next_step_prompt, persist=False)
 
         try:
+            logger.info(f"agent thinking...")
+            if self.conversation_id:
+                await send_notification_async(
+                    str(self.conversation_id),
+                    "agent.thoughts.start",
+                    {"content": "agent thinking"},
+                )
             # Get response with tool options
             response = await self.llm.ask_tool(
                 messages=self.messages,
@@ -85,11 +92,11 @@ class ToolCallAgent(ReActAgent):
         content = response.content if response and response.content else ""
 
         # Log response info
-        logger.info(f"agent thinking done")
+        logger.info(f"agent thinking done: {content}")
         if self.conversation_id:
             await send_notification_async(
                 str(self.conversation_id),
-                "agent.thoughts",
+                "agent.thoughts.finish",
                 {"content": content},
             )
         logger.info(
@@ -98,22 +105,8 @@ class ToolCallAgent(ReActAgent):
 
         if tool_calls:
             logger.info(
-                f"🧰 Tools being prepared: {[call.function.name for call in tool_calls]}"
+                f"🧰 Tools being prepared: {[ f'{call.function.name}({call.function.arguments})' for call in tool_calls]}"
             )
-            if self.conversation_id:
-                await send_notification_async(
-                    str(self.conversation_id),
-                    "agent.tools_prepared",
-                    {"tools": [call.function.name for call in tool_calls]},
-                )
-            logger.info(f"🔧 Tool arguments: {tool_calls[0].function.arguments}")
-            if self.conversation_id:
-                await send_notification_async(
-                    str(self.conversation_id),
-                    "agent.tool_args",
-                    {"arguments": tool_calls[0].function.arguments},
-                )
-
         try:
             if response is None:
                 raise RuntimeError("No response received from the LLM")
@@ -180,63 +173,19 @@ class ToolCallAgent(ReActAgent):
             # Reset base64_image for each tool call
             self._current_base64_image = None
 
-            result = await self.execute_tool(command)
+            result, raw_result = await self.execute_tool(command)
 
             if self.max_observe:
                 result = result[: self.max_observe]
 
             logger.info(
-                f"🎯 Tool '{command.function.name}' SUCCESS!"
+                f"🎯 Tool '{command.function.name}' finished! Result: {result}"
             )
-
-            # If this is a special tool (e.g., ask_human), persist an assistant-facing message
-            # and skip persisting a tool-role message.
-            if self._is_special_tool(command.function.name):
-                raw = getattr(self, "_last_tool_result", None)
-                content = None
-                # Attempt to format a user-facing question for ask_human
-                try:
-                    if isinstance(raw, dict):
-                        payload = raw
-                    else:
-                        payload = getattr(raw, "output", None) or {}
-                    if isinstance(payload, dict) and payload.get("type") == "ask_human":
-                        question = payload.get("question") or ""
-                        attachments = payload.get("attachments") or []
-                        options = payload.get("response_options") or []
-                        lines: List[str] = []
-                        lines.append(f"Pertanyaan: {question}")
-                        if attachments:
-                            lines.append("Lampiran:")
-                            for att in attachments:
-                                t = att.get("type") or "file"
-                                u = att.get("url") or ""
-                                lines.append(f"- ({t}) {u}")
-                        if options:
-                            lines.append("Opsi jawaban:")
-                            for op in options:
-                                lines.append(f"- {op}")
-                        content = "\n".join(lines)
-                except Exception:
-                    # Fallback: use the observation string
-                    content = None
-
-                if not content:
-                    content = str(result)
-
-                self.update_memory(
-                    role="assistant",
-                    content=content,
-                    base64_image=self._current_base64_image,
-                )
-                results.append(str(result))
-                # Skip tool-role message for special tools and stop further execution
-                break
 
             # Standard case: add tool response as a tool message
             self.update_memory(
                 role="tool",
-                content=result,
+                content=raw_result,
                 tool_call_id=command.id,
                 name=command.function.name,
                 base64_image=self._current_base64_image,
@@ -245,14 +194,16 @@ class ToolCallAgent(ReActAgent):
 
         return "\n\n".join(results)
 
-    async def execute_tool(self, command: ToolCall) -> str:
+    async def execute_tool(self, command: ToolCall) -> Tuple[str, str]:
         """Execute a single tool call with robust error handling"""
         if not command or not command.function or not command.function.name:
-            return "Error: Invalid command format"
+            msg = "Error: Invalid command format"
+            return msg, msg
 
         name = command.function.name
         if name not in self.available_tools.tool_map:
-            return f"Error: Unknown tool '{name}'"
+            msg = f"Error: Unknown tool '{name}'"
+            return msg, msg
 
         try:
             # Parse arguments
@@ -267,7 +218,13 @@ class ToolCallAgent(ReActAgent):
 
             # Execute the tool
             logger.info(f"🔧 Activating tool: '{name}'...")
-            result = await self.available_tools.execute(name=name, tool_input=args)
+            if self.conversation_id:
+                await send_notification_async(
+                    str(self.conversation_id),
+                    "agent.tools_prepared",
+                    {"tool_name": name, "tool_args": args, "status":"execute"},
+                )
+            result = await self.available_tools.execute(name=name, tool_input=args, agent=self)
 
             # Expose raw result for act() to use when needed (e.g., ask_human)
             try:
@@ -290,8 +247,13 @@ class ToolCallAgent(ReActAgent):
                 if result
                 else f"Cmd `{name}` completed with no output"
             )
-
-            return observation
+            if self.conversation_id:
+                await send_notification_async(
+                    str(self.conversation_id),
+                    "agent.tool_result",
+                    {"tool_name": name, "tool_args": args,"result": str(result), "status":"success"},
+                )
+            return observation, str(result)
         except json.JSONDecodeError:
             error_msg = f"Error parsing arguments for {name}: Invalid JSON format"
             logger.error(
@@ -303,7 +265,8 @@ class ToolCallAgent(ReActAgent):
                     "agent.tool_error",
                     {"tool": name, "error": error_msg},
                 )
-            return f"Error: {error_msg}"
+            msg = f"Error: {error_msg}"
+            return msg, msg
         except Exception as e:
             error_msg = f"⚠️ Tool '{name}' encountered a problem: {str(e)}"
             logger.exception(error_msg)
@@ -313,7 +276,8 @@ class ToolCallAgent(ReActAgent):
                     "agent.tool_error",
                     {"tool": name, "error": str(e)},
                 )
-            return f"Error: {error_msg}"
+            msg = f"Error: {error_msg}"
+            return msg, msg
 
     async def _handle_special_tool(self, name: str, result: Any, **kwargs):
         """Handle special tool execution and state changes"""

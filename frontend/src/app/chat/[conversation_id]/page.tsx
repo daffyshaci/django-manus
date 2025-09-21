@@ -14,13 +14,42 @@ import {
 } from "@/components/ai-elements/conversation";
 import {
   Message as AiMessage,
-  MessageAvatar,
   MessageContent,
 } from "@/components/ai-elements/message";
-import { Response as AiResponse } from "@/components/ai-elements/response";
-import { Image as AIImage } from "@/components/ai-elements/image";
-import { PromptInput } from "@/components/ai-elements/prompt-input";
-import { Tool, ToolContent, ToolHeader, ToolOutput } from "@/components/ai-elements/tool";
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolOutput,
+  ToolInput,
+} from '@/components/ai-elements/tool';
+import {
+  PromptInput,
+  PromptInputActionAddAttachments,
+  PromptInputActionMenu,
+  PromptInputActionMenuContent,
+  PromptInputActionMenuItem,
+  PromptInputActionMenuTrigger,
+  PromptInputAttachment,
+  PromptInputAttachments,
+  PromptInputBody,
+  PromptInputButton,
+  PromptInputModelSelect,
+  PromptInputModelSelectContent,
+  PromptInputModelSelectItem,
+  PromptInputModelSelectTrigger,
+  PromptInputModelSelectValue,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputToolbar,
+  PromptInputTools,
+  usePromptInputAttachments,
+} from '@/components/ai-elements/prompt-input';
+import { MessageSquare } from "lucide-react";
+import { Loader } from "@/components/ai-elements/loader";
+import { Response } from "@/components/ai-elements/response";
+import { Task, TaskContent, TaskItem, TaskItemFile, TaskTrigger } from "@/components/ai-elements/task";
+import { Button } from "@/components/ui/button";
 
 // Types aligned with backend app/api.py schemas
 // ConversationSchema -> { id, title, llm_model }
@@ -64,6 +93,7 @@ function isMessageSchema(v: unknown): v is MessageSchema {
 
 // Handle possible WS payloads like { event: "message.created", payload: { ...Message } }
 function extractMessageFromWS(data: unknown): MessageSchema | null {
+  console.log(data)
   if (isMessageSchema(data)) return data;
   if (data && typeof data === "object") {
     const o = data as Record<string, unknown>;
@@ -72,6 +102,7 @@ function extractMessageFromWS(data: unknown): MessageSchema | null {
     if (typeof o.event === "string") {
       // Case A: { event, payload: Message }
       if (isMessageSchema(payload)) {
+        console.log("out: ", payload)
         return payload as MessageSchema;
       }
       // Case B: { event, payload: { message: Message } }
@@ -87,6 +118,11 @@ function extractMessageFromWS(data: unknown): MessageSchema | null {
   return null;
 }
 
+const models = [
+    { id: 'gpt-4o', name: 'GPT-4o' },
+    { id: 'claude-opus-4-20250514', name: 'Claude 4 Opus' },
+  ];
+
 export default function ChatPage() {
   const params = useParams();
   const router = useRouter();
@@ -100,10 +136,41 @@ export default function ChatPage() {
     getToken: async () => (await clerkGetToken?.({ template: "manus" })) ?? null,
   });
 
+  const [model, setModel] = useState(models[0].id);
+
   const [conversation, setConversation] = useState<ConversationSchema | null>(null);
   const [messages, setMessages] = useState<MessageSchema[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+
+  const THINKING_ID = "__thinking__";
+  function upsertThinking(show: boolean, text: string = "Agent thinking...") {
+    if (!conversationId) return;
+    if (show) {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === THINKING_ID)) return prev;
+        const temp: MessageSchema = {
+          id: THINKING_ID,
+          conversation_id: conversationId,
+          role: "assistant",
+          content: text,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        const next = [...prev, temp];
+        next.sort((a, b) => {
+          const ta = a.created_at ? Date.parse(a.created_at) : 0;
+          const tb = b.created_at ? Date.parse(b.created_at) : 0;
+          return ta - tb;
+        });
+        return next;
+      });
+    } else {
+      setMessages((prev) => prev.filter((m) => m.id !== THINKING_ID));
+    }
+  }
 
   // Initial fetch conversation detail + messages
   useEffect(() => {
@@ -116,12 +183,7 @@ export default function ChatPage() {
         const detail = await restFetch<ConversationDetailSchema>(`/v1/chat/conversations/${conversationId}`);
         if (!mounted) return;
         setConversation(detail.conversation);
-        setMessages((detail.messages || []).slice().sort((a, b) => {
-          const ta = a.created_at ? Date.parse(a.created_at) : 0;
-          const tb = b.created_at ? Date.parse(b.created_at) : 0;
-          return ta - tb; // ascending
-        }));
-        // trigger-first-message dihapus karena backend kini memulai Celery task saat create_conversation
+        setMessages((detail.messages || []));
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
@@ -139,8 +201,26 @@ export default function ChatPage() {
     conversationId: conversationId || "",
     getToken: async () => (await clerkGetToken?.({ template: "manus" })) ?? null,
     onMessage: (data) => {
+
+      const eventName =
+        data && typeof data === "object" && typeof (data as any).event === "string"
+          ? ((data as any).event as string)
+          : undefined;
+
+      if (eventName === "agent.thoughts.start" || eventName === "agent.tools_prepared" || eventName === "agent.tool_result") {
+        setAgentBusy(true);
+        upsertThinking(true);
+      }
+      if (eventName === "agent.finished") {
+        setAgentBusy(false);
+        upsertThinking(false);
+      }
+
       const msg = extractMessageFromWS(data);
       if (msg && msg.conversation_id === conversationId) {
+        // On real assistant/user message, replace thinking with actual content, then keep thinking if agent continues
+        upsertThinking(false);
+        setAgentBusy(true);
         setMessages((prev) => {
           // Avoid duplicates by id
           if (prev.some((m) => m.id === msg.id)) return prev;
@@ -150,8 +230,11 @@ export default function ChatPage() {
             const tb = b.created_at ? Date.parse(b.created_at) : 0;
             return ta - tb;
           });
+          console.log(next)
           return next;
         });
+        // Show thinking again until finished if backend continues processing
+        upsertThinking(true);
       }
     },
   });
@@ -176,6 +259,8 @@ export default function ChatPage() {
         updated_at: new Date().toISOString(),
       };
       setMessages((prev) => [...prev, temp]);
+      setAgentBusy(true);
+      upsertThinking(true);
 
       // Build request body, include first image (optional) as base64 if available
       let base64_image: string | undefined = undefined;
@@ -196,6 +281,7 @@ export default function ChatPage() {
         body: JSON.stringify({ content, ...(base64_image ? { base64_image } : {}) }),
       });
       // The real assistant responses will come via WS
+      setInput("");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -204,91 +290,103 @@ export default function ChatPage() {
 
   if (!isSignedIn) {
     return (
-      <div className="mx-auto max-w-3xl p-6">
-        <p className="text-sm text-gray-600">Anda harus login untuk mengakses percakapan.</p>
-      </div>
+      // redirect login
+      <div></div>
     );
   }
 
   if (!conversationId) {
     return (
-      <div className="mx-auto max-w-3xl p-6">
-        <p className="text-sm text-red-600">Conversation ID tidak valid.</p>
-      </div>
+      // redirect home
+      <div></div>
     );
   }
 
   return (
-    <div className="mx-auto flex h-[100dvh] max-w-3xl flex-col p-0">
-      <div className="flex items-center justify-between p-4">
-        <button
-          type="button"
-          onClick={() => router.push("/")}
-          className="text-sm text-blue-600 hover:underline"
-        >
-          ← Kembali
-        </button>
-        <div className="text-sm text-gray-500">{conversation?.llm_model}</div>
-      </div>
+    <div className="max-w-4xl mx-auto p-6 h-[600px]">
+      <div className="flex flex-col justify-between h-full">
+        <Conversation>
+          <ConversationContent>
+            {messages.length === 0 ? (
+              <ConversationEmptyState
+                icon={<MessageSquare className="size-12" />}
+                title="Start a conversation"
+                description="Type a message below to begin chatting"
+              />
+            ) : (
+              messages.map((message) => (
+                <AiMessage from={message.role as 'system' | 'user' | 'assistant'} key={message.id}>
+                  <MessageContent variant="flat">
+                    <Response>
+                      {message.id === THINKING_ID ? (
+                        <Loader />
+                      ) : (
+                        message.content ?? ""
+                      )}
+                    </Response>
+                  </MessageContent>
+                </AiMessage>
+              ))
+            )}
+            {/* Removed extra loader; thinking shown as a message */}
+            <Task className="w-full">
+              {/* <TaskTrigger title="Found project files" /> */}
+              <TaskContent>
+                <TaskItem>
+                  Read <TaskItemFile
+                    onClick={() => {
+                      window.open('/chat/' + conversationId + '/index.md', '_blank');
+                    }}
+                  >
+                      index.md
+                  </TaskItemFile>
+                </TaskItem>
+              </TaskContent>
+            </Task>
+          </ConversationContent>
+          <ConversationScrollButton />
+        </Conversation>
 
-      <Conversation className="flex-1">
-        <ConversationContent>
-          {loading && (
-            <div className="p-4 text-sm text-gray-500">Memuat percakapan...</div>
-          )}
-          {error && (
-            <div className="m-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-              {error}
-            </div>
-          )}
-
-          {!loading && messages.length === 0 && !error ? (
-            <ConversationEmptyState title="Belum ada pesan" description="Mulai percakapan dengan mengetik pesan di bawah" />
-          ) : null}
-
-          {messages.map((m) => {
-            const from: "user" | "assistant" = m.role === "user" ? "user" : "assistant";
-            const showAsTool = m.role === "tool";
-            return (
-              <div key={m.id}>
-                {showAsTool ? (
-                  <Tool defaultOpen className="max-w-[80%]" key={`tool-${m.id}`}>
-                    <ToolHeader type={`tool-${m.tool_call_id ?? "call"}` as `tool-${string}`} state="output-available" />
-                    <ToolContent>
-                      <ToolOutput output={m.content ?? undefined} errorText={undefined} />
-                    </ToolContent>
-                  </Tool>
-                ) : (
-                  <AiMessage from={from} className="">
-                    <MessageAvatar
-                      src={from === "user" ? "/window.svg" : "/globe.svg"}
-                      name={from === "user" ? "You" : "AI"}
-                    />
-                    <MessageContent>
-                      {m.base64_image ? (
-                        <div className="mt-2">
-                          <AIImage base64={m.base64_image} uint8Array={new Uint8Array(0)} mediaType="image/png" alt="image" />
-                        </div>
-                      ) : null}
-                      <AiResponse>{m.content || ""}</AiResponse>
-                    </MessageContent>
-                  </AiMessage>
-                )}
-              </div>
-            );
-          })}
-        </ConversationContent>
-        <ConversationScrollButton />
-      </Conversation>
-
-      <div className="sticky bottom-0 w-full border-t bg-background p-2">
-        <PromptInput
-          accept="image/*"
-          multiple={false}
-          onSubmit={handlePromptSubmit}
-          className="mx-auto w-full max-w-3xl"
-        />
+        <PromptInput onSubmit={handlePromptSubmit} className="mt-4" globalDrop multiple>
+          <PromptInputBody>
+            <PromptInputAttachments>
+              {(attachment) => <PromptInputAttachment data={attachment} />}
+            </PromptInputAttachments>
+            <PromptInputTextarea
+              onChange={(e) => setInput(e.target.value)}
+              value={input}
+            />
+          </PromptInputBody>
+          <PromptInputToolbar>
+            <PromptInputTools>
+              <PromptInputActionMenu>
+                <PromptInputActionMenuTrigger />
+                <PromptInputActionMenuContent>
+                  <PromptInputActionAddAttachments />
+                </PromptInputActionMenuContent>
+              </PromptInputActionMenu>
+              <PromptInputModelSelect
+                onValueChange={(value: string) => {
+                  setModel(value);
+                }}
+                value={model}
+              >
+                <PromptInputModelSelectTrigger>
+                  <PromptInputModelSelectValue />
+                </PromptInputModelSelectTrigger>
+                <PromptInputModelSelectContent>
+                  {models.map((model) => (
+                    <PromptInputModelSelectItem key={model.id} value={model.id}>
+                      {model.name}
+                    </PromptInputModelSelectItem>
+                  ))}
+                </PromptInputModelSelectContent>
+              </PromptInputModelSelect>
+            </PromptInputTools>
+            <PromptInputSubmit disabled={!input && !loading} />
+          </PromptInputToolbar>
+        </PromptInput>
       </div>
     </div>
-  );
+  )
 }

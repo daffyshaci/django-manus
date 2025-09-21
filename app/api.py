@@ -12,6 +12,8 @@ from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import IntegrityError
 from common.auth import CombinedAuth
 from .logger import logger
+import os
+from app.config import config
 
 if TYPE_CHECKING:
     from users.models import User
@@ -118,6 +120,8 @@ async def create_conversation(request: AuthenticatedRequest, data: ConversationC
             role=Message.ROLE.USER,
             content=data.content,
         )
+
+        # No I/O-bound operations here. Daytona volume provisioning is handled in Celery task.
 
         # Start background processing immediately after creating the conversation
         # Prepare overrides ensuring conversation's llm_model is respected
@@ -368,3 +372,34 @@ async def get_conversation_files(request: AuthenticatedRequest, conversation_id:
         logger.error(f"Failed to retrieve conversation files for {conversation_id}: {e}")
         logger.exception("Detailed error in get_conversation_files:")
         return JsonResponse({"error": "Failed to retrieve conversation files", "detail": str(e)}, status=500)
+
+
+@router.get(
+    "/conversations/{conversation_id}/volume-info",
+    response=dict,
+    auth=CombinedAuth()
+)
+async def get_conversation_volume_info(request: AuthenticatedRequest, conversation_id: UUID) -> dict | JsonResponse:
+    """Debug-only endpoint: returns Daytona volume info and configured work_dir for the conversation.
+    This helps verify provisioning and mounting without exposing sensitive data beyond the authenticated user scope.
+    """
+    try:
+        conv = await Conversation.objects.aget(id=conversation_id, user=request.auth)
+        # Pull work_dir from settings/config
+        from app.config import config as _cfg
+        work_dir = None
+        try:
+            sbox = getattr(_cfg, 'sandbox', None)
+            work_dir = getattr(sbox, 'work_dir', None)
+        except Exception:
+            work_dir = None
+        return {
+            "conversation_id": str(conv.id),
+            "daytona_volume_id": conv.daytona_volume_id,
+            "daytona_volume_name": conv.daytona_volume_name,
+            "work_dir": work_dir,
+        }
+    except ObjectDoesNotExist:
+        return JsonResponse({"error": "Conversation not found"}, status=404)
+    except Exception as e:
+        return JsonResponse({"error": "Failed to fetch volume info", "detail": str(e)}, status=500)

@@ -8,6 +8,7 @@ from celery import shared_task  # type: ignore
 from app.agent.manus import Manus
 from app.agent.data_analysis import DataAnalysis
 from app.logger import logger
+from app.models import Conversation
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
@@ -36,22 +37,39 @@ def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, ag
     kwargs: Dict[str, Any] = dict(agent_kwargs or {})
     if conversation_id and "conversation_id" not in kwargs:
         kwargs["conversation_id"] = str(conversation_id)
-    
+
     # Tambahkan agent_type dan llm_overrides jika tersedia
     if agent_type and "agent_type" not in kwargs:
         kwargs["agent_type"] = agent_type
     if llm_overrides and "llm_overrides" not in kwargs:
         kwargs["llm_overrides"] = llm_overrides
 
+    # try create volume
+    try:
+        from daytona import Daytona
+
+        conv_volume_name = f"conv_{conversation_id}"
+        conv = Conversation.objects.get(id=conversation_id)
+        if not conv.daytona_volume_id:
+            daytona = Daytona()
+            volume = daytona.volume.get(conv_volume_name, create=True)
+            conv.daytona_volume_id = volume.id
+            conv.daytona_volume_name = f"manus-{conversation_id}"
+            conv.save()
+    except Exception as e:
+        logger.error(f"Error creating volume for conversation {conversation_id}: {e}")
+        pass
+
     async def _run() -> str:
         # Pilih agent berdasarkan agent_type
         agent_class = Manus  # default
         if agent_type == "data_analysis":
             agent_class = DataAnalysis
-        
+
+
+        logger.info(f"Creating {agent_class.__name__} agent with kwargs: {kwargs}")
         agent = await agent_class.create(**kwargs)
         try:
-            logger.warning(f"Processing your request via {agent_class.__name__} agent (Celery task)...")
             # Jika conversation_id tersedia, history (termasuk pesan user terbaru) sudah dimuat,
             # jadi jangan duplikasi dengan mengirim prompt lagi.
             if conversation_id:
@@ -63,7 +81,6 @@ def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, ag
         finally:
             # Pastikan resource agent dibersihkan
             await agent.cleanup()
-
 
     # Jalankan konteks async di dalam task Celery sync
     return asyncio.run(_run())

@@ -12,6 +12,7 @@ from typing import Optional, Protocol, Tuple, Union, runtime_checkable
 from app.config import SandboxSettings, config
 from app.exceptions import ToolError
 from app.sandbox.client import SANDBOX_CLIENT
+from app.logger import logger
 
 
 PathLike = Union[str, Path]
@@ -96,10 +97,23 @@ class SandboxFileOperator(FileOperator):
     async def _ensure_sandbox_initialized(self) -> None:
         """Ensure sandbox is initialized before performing operations."""
         if not getattr(self.sandbox_client, "sandbox", None):
+            work_dir = (config.sandbox.work_dir if config.sandbox else "/home/daytona/workspace") or "/home/daytona/workspace"
+            conv_id = getattr(self.sandbox_client, "_conversation_id", None)
+            logger.info(
+                f"SandboxFileOperator: initializing sandbox with conversation_id={conv_id}, work_dir={work_dir}"
+            )
             await self.sandbox_client.create(
                 config=config.sandbox or SandboxSettings(),
-                conversation_id=getattr(self.sandbox_client, "_conversation_id", None),
+                conversation_id=conv_id,
             )
+            # After creation, list work_dir to verify attachment/state
+            try:
+                listing = await self.sandbox_client.run_command(f"ls -la {work_dir} || true")
+                logger.info(
+                    f"SandboxFileOperator: contents of work_dir after sandbox init (post-create):\n{listing}"
+                )
+            except Exception as e:
+                logger.warning(f"SandboxFileOperator: failed to list work_dir after init: {e}")
 
     async def read_file(self, path: PathLike) -> str:
         await self._ensure_sandbox_initialized()

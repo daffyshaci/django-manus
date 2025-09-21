@@ -247,6 +247,7 @@ class BaseAgent(BaseModel, ABC):
         items: List[dict] = files if isinstance(files, list) else [files]
         if not items:
             return
+
         if persist and self.persist_files_hook:
             try:
                 result = self.persist_files_hook(self, items)
@@ -268,6 +269,29 @@ class BaseAgent(BaseModel, ABC):
         Safe to call from Celery tasks where Django has already been initialized.
         """
         self.conversation_id = str(conversation_id)
+        # Ensure sandbox client is aware of this conversation to enable per-conversation persistence/volumes
+        try:
+            from app.sandbox.client import SANDBOX_CLIENT  # local import to avoid cycles at module load
+            setattr(SANDBOX_CLIENT, "_conversation_id", self.conversation_id)
+
+            # Try to propagate Daytona volume info if it exists on the Conversation
+            try:
+                from app.models import Conversation as ConversationDB
+                conv_obj = ConversationDB.objects.filter(id=self.conversation_id).only(
+                    "daytona_volume_id", "daytona_volume_name"
+                ).first()
+                if conv_obj:
+                    if getattr(conv_obj, "daytona_volume_id", None):
+                        setattr(SANDBOX_CLIENT, "_volume_id", conv_obj.daytona_volume_id)
+                    if getattr(conv_obj, "daytona_volume_name", None):
+                        setattr(SANDBOX_CLIENT, "_volume_name", conv_obj.daytona_volume_name)
+
+            except Exception:
+                # Non-fatal if ORM not ready here; hooks below will still work
+                pass
+        except Exception:
+            # Best-effort; sandbox may be initialized later by file operators
+            pass
 
         async def _hook(agent: "BaseAgent", role: str, content: str, base64_image: Optional[str], extra: dict):
             try:
@@ -307,10 +331,6 @@ class BaseAgent(BaseModel, ABC):
                         conversation=conv, content=content, base64_image=base64_image
                     )
 
-                # Upsert Memory for this conversation and append message JSON
-                # async def _get_or_create_memory():
-                #     return MemoryDB.objects.get_or_create(conversation=conv, defaults={"messages": []})
-
                 memory, _ = await sync_to_async(MemoryDB.objects.get_or_create)(conversation=conv, defaults={"messages": []})
                 await sync_to_async(memory.add_message)(msg_obj)
 
@@ -337,6 +357,7 @@ class BaseAgent(BaseModel, ABC):
         self.persist_message_hook = _hook
 
         async def _files_hook(agent: "BaseAgent", items: List[dict]):
+
             try:
                 from asgiref.sync import sync_to_async
                 from app.models import Conversation as ConversationDB
@@ -350,25 +371,25 @@ class BaseAgent(BaseModel, ABC):
                     if not path:
                         continue
 
-                    filename = (it.get("filename") or path.split("/")[-1]).strip()
+                    filename = (path.split("/")[-1]).strip()
 
                     # Read file content from sandbox if not provided
-                    stored_content = it.get("stored_content") or ""
+                    stored_content = it.get("content") or ""
                     size_bytes = it.get("size_bytes") or 0
                     sha256 = it.get("sha256") or ""
 
                     # If content not provided, read from sandbox
-                    if not stored_content and not size_bytes:
+                    if not stored_content:
                         try:
                             # Read file content from sandbox
                             file_content = await SANDBOX_CLIENT.read_file(path)
                             stored_content = file_content
                             size_bytes = len(file_content.encode('utf-8'))
-
-                            # Calculate SHA256 hash
-                            sha256_hash = hashlib.sha256()
-                            sha256_hash.update(file_content.encode('utf-8'))
-                            sha256 = sha256_hash.hexdigest()
+                            # compute sha256
+                            try:
+                                sha256 = hashlib.sha256(file_content.encode('utf-8')).hexdigest()
+                            except Exception:
+                                sha256 = ""
                         except Exception as read_error:
                             logger.warning(f"Failed to read file {path} from sandbox: {read_error}")
                             # Continue with metadata only if file doesn't exist or can't be read
@@ -385,30 +406,32 @@ class BaseAgent(BaseModel, ABC):
                         "updated_at": _tz.now(),
                     }
                     # Update if exists for same conversation+path, else create
-                    from django.db import transaction as _tx
-                    async with _tx.async_atomic():
-                        obj, created = await sync_to_async(FileArtifact.objects.update_or_create)(
-                            conversation=conv,
-                            path=path,
-                            defaults=defaults,
-                        )
-                        # Emit WS event
-                        try:
-                            payload = {
-                                "id": str(obj.id),
-                                "conversation_id": str(conv.id),
-                                "path": obj.path,
-                                "filename": obj.filename,
-                                "size_bytes": obj.size_bytes,
-                                "sha256": obj.sha256,
-                                "mime_type": obj.mime_type,
-                                "created": created,
-                                "created_at": obj.created_at.isoformat() if obj.created_at else None,
-                                "updated_at": obj.updated_at.isoformat() if obj.updated_at else None,
-                            }
-                            await send_notification_async(str(conv.id), "file.created" if created else "file.updated", {"file": payload})
-                        except Exception:
-                            pass
+
+                    obj, created = await sync_to_async(FileArtifact.objects.update_or_create)(
+                        conversation=conv,
+                        path=path,
+                        defaults=defaults,
+                    )
+
+                    # Emit WS event
+                    try:
+                        payload = {
+                            "id": str(obj.id),
+                            "conversation_id": str(conv.id),
+                            "path": obj.path,
+                            "filename": obj.filename,
+                            "size_bytes": obj.size_bytes,
+                            "sha256": obj.sha256,
+                            "mime_type": obj.mime_type,
+                            "created": created,
+                            "created_at": obj.created_at.isoformat() if getattr(obj, "created_at", None) else None,
+                            "updated_at": obj.updated_at.isoformat() if getattr(obj, "updated_at", None) else None,
+                        }
+                        event_name = "file.created" if created else "file.updated"
+                        await send_notification_async(str(conv.id), event_name, {"file": payload})
+
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.error(f"Django files persistence hook error: {e}")
 

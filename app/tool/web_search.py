@@ -230,7 +230,11 @@ class WebSearch(BaseTool):
             "goal": {
                 "type": "string",
                 "description": "(optional) Extraction goal for 'extract_content'",
-            }
+            },
+            "llm_model": {
+                "type": "string",
+                "description": "(optional) Override the LLM model to use specifically for extraction (does not affect conversation model).",
+            },
         },
         "required": ["query", "goal"],
     }
@@ -254,6 +258,7 @@ class WebSearch(BaseTool):
         extract_content: Optional[bool] = None,
         goal: Optional[str] = None,
         fetch_content: Optional[bool] = None,
+        llm_model: Optional[str] = None,
     ) -> SearchResponse:
         """
         Execute a Web search and return detailed search results.
@@ -266,6 +271,7 @@ class WebSearch(BaseTool):
             extract_content: Whether to extract content from result pages
             goal: Goal text to guide LLM extraction
             fetch_content: Deprecated; maintained for compatibility. Use extract_content instead.
+            llm_model: Optional override for the LLM model to use in extraction
 
         Returns:
             A structured response containing search results and metadata
@@ -327,7 +333,7 @@ class WebSearch(BaseTool):
                             # Use LLM to extract according to goal
                             try:
                                 extracted_text = await self._extract_with_llm(
-                                    page_content=content, goal=goal, url=result.url
+                                    page_content=content, goal=goal, url=result.url, llm_model=llm_model
                                 )
                             except Exception as e:
                                 logger.warning(f"LLM extraction failed for {result.url}: {e}")
@@ -505,8 +511,15 @@ class WebSearch(BaseTool):
             ),
         )
 
-    async def _extract_with_llm(self, page_content: str, goal: str, url: Optional[str] = None) -> Optional[str]:
-        """Use LLM to extract content from page_content based on the goal."""
+    async def _extract_with_llm(self, page_content: str, goal: str, url: Optional[str] = None, llm_model: Optional[str] = None) -> Optional[str]:
+        """Use LLM to extract content from page_content based on the goal.
+
+        Args:
+            page_content: The raw page content to process
+            goal: The extraction goal/instructions
+            url: Optional URL for reference
+            llm_model: Optional override model name to use for this extraction call
+        """
         try:
             system_msg = {"role": "system", "content": EXTRACT_CONTENT_SYSTEM_PROMPT}
             user_msg = {
@@ -539,6 +552,11 @@ class WebSearch(BaseTool):
                 },
             }
 
+            extra_params = {}
+            if llm_model:
+                # Override the model for this specific ask_tool call
+                extra_params["model"] = llm_model
+
             response = await self.llm.ask_tool(
                 messages=[user_msg],
                 system_msgs=[system_msg],
@@ -546,6 +564,8 @@ class WebSearch(BaseTool):
                 tool_choice="required",
                 temperature=0.2,
                 timeout=180,
+                model="qwen3-32b",
+                **extra_params,
             )
 
             if response and getattr(response, "tool_calls", None):

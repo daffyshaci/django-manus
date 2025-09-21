@@ -13,6 +13,9 @@ class Conversation(TimeStampedUUIDModel):
     llm_model = models.CharField(max_length=255, blank=True, null=True)
     agent_type = models.CharField(max_length=255, blank=True, null=True)
     llm_overrides = models.JSONField(default=dict, blank=True)
+    # Daytona Volume persistence per conversation
+    daytona_volume_id = models.CharField(max_length=128, blank=True, null=True)
+    daytona_volume_name = models.CharField(max_length=255, blank=True, null=True)
 
     def __str__(self):
         return f"{self.user.username} - {self.title or ''}"
@@ -188,7 +191,7 @@ class Memory(TimeStampedUUIDModel):
         return result
 
 
-class FileArtifact(models.Model):
+class FileArtifact(TimeStampedUUIDModel):
     """Stores metadata about files produced/used in a conversation."""
 
     conversation = models.ForeignKey(
@@ -200,8 +203,6 @@ class FileArtifact(models.Model):
     sha256 = models.CharField(max_length=64, blank=True, default="")
     mime_type = models.CharField(max_length=100, blank=True, default="")
     stored_content = models.TextField(blank=True, default="")  # optional snapshot of content
-    created_at = models.DateTimeField(default=timezone.now)
-    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         indexes = [
@@ -211,4 +212,39 @@ class FileArtifact(models.Model):
 
     def __str__(self) -> str:
         return f"{self.filename} ({self.path})"
+
+
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
+import os
+try:
+    from .logger import logger as _app_logger  # optional app logger
+except Exception:  # pragma: no cover
+    import logging as _logging
+    _app_logger = _logging.getLogger(__name__)
+
+
+@receiver(post_delete, sender=Conversation)
+def delete_daytona_volume_on_conversation_delete(sender, instance: Conversation, **kwargs):
+    """Optionally enqueue Daytona volume deletion when a Conversation is removed.
+
+    Controlled via env var DAYTONA_DELETE_VOLUME_ON_CONVERSATION_DELETE.
+    The actual I/O runs in Celery task; this signal must not perform any network or SDK calls.
+    """
+    try:
+        flag = os.getenv("DAYTONA_DELETE_VOLUME_ON_CONVERSATION_DELETE", "0").lower()
+        if flag not in ("1", "true", "yes", "on"):  # disabled by default
+            return
+        vol_key = instance.daytona_volume_id or instance.daytona_volume_name
+        if not vol_key:
+            return
+        # Enqueue asynchronous deletion task
+        try:
+            from app.tasks import delete_daytona_volume_task
+            delete_daytona_volume_task.delay(vol_key, str(instance.id))
+            _app_logger.info(f"Enqueued Daytona volume deletion for conversation {instance.id}: {vol_key}")
+        except Exception as e:
+            _app_logger.warning(f"Failed to enqueue Daytona volume deletion: {e}")
+    except Exception as e:
+        _app_logger.warning(f"Daytona volume cleanup enqueue error (non-fatal): {e}")
 

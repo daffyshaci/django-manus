@@ -170,6 +170,9 @@ def fake_sandbox(monkeypatch):
     monkeypatch.setattr(bash_mod, "SANDBOX_CLIENT", fake, raising=True)
     # Also update any pre-instantiated operator in StrReplaceEditor
     editor_mod.StrReplaceEditor._sandbox_operator.sandbox_client = fake
+    # Ensure BaseAgent persistence hook uses the fake sandbox too
+    import app.agent.base as base_mod
+    monkeypatch.setattr(base_mod, "SANDBOX_CLIENT", fake, raising=True)
     return fake
 
 
@@ -267,3 +270,55 @@ async def test_wrong_paths_handling_and_mapping(fake_sandbox):
     fake_sandbox._ensure_dir(dir_path)
     with pytest.raises(Exception):
         await editor.execute(command="str_replace", path=dir_path, old_str="foo", new_str="bar")
+
+
+@pytest.mark.asyncio
+@pytest.mark.django_db
+async def test_file_editor_create_persists_file_artifact(fake_sandbox):
+    import asyncio
+    from django.contrib.auth import get_user_model
+    from app.models import Conversation, FileArtifact
+    from app.agent.manus import Manus
+
+    User = get_user_model()
+    user = await User.objects.acreate(username="tester_persist")
+
+    conv = await Conversation.objects.acreate(user=user, title="t")
+
+    # Init sandbox
+    await fake_sandbox.create(config=config.sandbox)
+
+    # Create agent with persistence attached
+    agent = await Manus.create(conversation_id=str(conv.id))
+
+    # Prepare editor with agent context
+    editor = StrReplaceEditor()
+    editor.agent = agent
+
+    path = "/workspace/new.txt"
+    content = "hello world"
+
+    # Execute create command
+    out = await editor.execute(command="create", path=path, file_text=content)
+    assert "File created successfully" in out
+
+    # Wait for background persist tasks to complete
+    if getattr(agent, "pending_persist_tasks", None):
+        pending = [t for t in agent.pending_persist_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            agent.pending_persist_tasks.clear()
+
+    # Compute mapped path as persisted by hook
+    op = SandboxFileOperator()
+    op.sandbox_client = fake_sandbox
+    mapped = op.to_sandbox_path(path)
+
+    # Verify FileArtifact created
+    artifacts = []
+    async for fa in FileArtifact.objects.filter(conversation=conv, path=mapped):
+        artifacts.append(fa)
+
+    assert len(artifacts) == 1
+    assert artifacts[0].filename.endswith("new.txt")
+    assert artifacts[0].stored_content.strip() == content

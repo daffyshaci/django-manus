@@ -714,6 +714,7 @@ class LLM:
                 messages = self.format_messages(messages, supports_images)
 
             # Calculate input token count
+            logger.info("Start check input token count")
             input_tokens = self.count_message_tokens(messages)
 
             # If there are tools, calculate token count for tool descriptions
@@ -723,10 +724,11 @@ class LLM:
                     tools_tokens += self.count_tokens(str(tool))
 
             input_tokens += tools_tokens
-
+            logger.info(f"Input tokens: {input_tokens}")
             # Check if token limits are exceeded
             if not self.check_token_limit(input_tokens):
                 error_message = self.get_limit_error_message(input_tokens)
+                logger.error(error_message)
                 # Raise a special exception that won't be retried
                 raise TokenLimitExceeded(error_message)
 
@@ -755,6 +757,7 @@ class LLM:
                 )
 
             params["stream"] = False  # Always use non-streaming for tool requests
+            logger.info("start call llm.")
             response: ChatCompletion = await self.client.chat.completions.create(
                 **params
             )
@@ -766,6 +769,7 @@ class LLM:
                 return None
 
             # Update token counts
+            logger.info("start update token count: ")
             self.update_token_count(
                 response.usage.prompt_tokens, response.usage.completion_tokens
             )

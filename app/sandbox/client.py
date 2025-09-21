@@ -7,6 +7,8 @@ import os
 import uuid
 import base64
 import shlex
+import asyncio
+from app.logger import logger
 
 
 class SandboxFileOperations(Protocol):
@@ -58,7 +60,6 @@ class BaseSandboxClient(ABC):
     async def create(
         self,
         config: Optional[SandboxSettings] = None,
-        volume_bindings: Optional[Dict[str, str]] = None,
         conversation_id: Optional[str] = None,
     ) -> None:
         """Creates sandbox."""
@@ -148,7 +149,6 @@ class DaytonaSandboxClient(BaseSandboxClient):
     async def create(
         self,
         config: Optional[SandboxSettings] = None,
-        volume_bindings: Optional[Dict[str, str]] = None,
         conversation_id: Optional[str] = None,
     ) -> None:
         # Lazy import to avoid hard dependency when not used
@@ -158,7 +158,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
             raise RuntimeError(
                 f"Daytona SDK is required for 'daytona' provider but not available: {e}"
             )
-
+        logger.info(f"Creating sandbox with config: {config}")
         cfg = config or SandboxSettings(
             use_sandbox=True,
             provider="daytona",
@@ -180,22 +180,124 @@ class DaytonaSandboxClient(BaseSandboxClient):
         )
         self._daytona = Daytona(dcfg)
         assert self._daytona is not None
-        # Create sandbox (use defaults per SDK quick start)
-        self.sandbox = self._daytona.create()
-        # Keep configured work dir for path mapping only (do not enforce as cwd)
+        # set conversation context early for later helpers
+        self._conversation_id = conversation_id
+
+        # Decide mount dir upfront
+        mount_dir = cfg.work_dir or "/home/daytona/workspace"
+
+        # Try to create sandbox with an existing or freshly created conversation volume
+        created_with_volume = False
+        conv = None
+        conv_volume_id = None
+        conv_volume_name = None
+        if conversation_id:
+            try:
+                # Fetch conversation and known volume info
+                from app.models import Conversation
+                conv = await Conversation.objects.aget(id=conversation_id)
+                conv_volume_id = getattr(conv, "daytona_volume_id", None)
+                conv_volume_name = getattr(conv, "daytona_volume_name", None) or f"manus-{conversation_id}"
+
+                # Ensure a volume exists if id missing: get or create by name
+                if not conv_volume_id:
+                    try:
+                        volume = self._daytona.volume.get(conv_volume_name, create=True)
+                        conv_volume_id = str(getattr(volume, "id", None) or getattr(volume, "uuid", None) or "") or None
+                        conv_volume_name = str(getattr(volume, "name", None) or "") or None
+                        logger.info(f"Created volume persistant. volume id: {conv_volume_id}. volume name: {conv_volume_name}")
+
+                        # Wait for volume to become ready before attempting to mount
+                        try:
+                            max_wait = int(os.getenv("DAYTONA_VOLUME_READY_TIMEOUT", "60"))
+                            poll_interval = float(os.getenv("DAYTONA_VOLUME_POLL_INTERVAL", "1"))
+                            waited = 0.0
+                            while waited < max_wait:
+                                try:
+                                    v = self._daytona.volume.get(conv_volume_name, create=False)
+                                    v_state = str(getattr(v, "status", None) or getattr(v, "state", None) or "").lower()
+                                    if v_state in ("", "ready", "available", "active", "created", "success", "ok"):
+                                        break
+                                    logger.info(f"Daytona volume '{conv_volume_name}' not ready yet (state={v_state}); waiting...")
+                                except Exception as _e:
+                                    logger.warning(f"Failed to query Daytona volume state while waiting: {_e}")
+                                    # Best-effort; continue polling a bit longer
+                                await asyncio.sleep(poll_interval)
+                                waited += poll_interval
+                        except Exception as _e:
+                            logger.warning(f"Volume readiness wait skipped due to error: {_e}")
+
+                        if conv_volume_id:
+                            try:
+                                from asgiref.sync import sync_to_async
+                                conv.daytona_volume_id = conv_volume_id
+                                conv.daytona_volume_name = conv_volume_name
+                                await sync_to_async(conv.save)(update_fields=["daytona_volume_id", "daytona_volume_name"])
+                            except Exception as e:
+                                logger.warning(f"Failed to persist conversation Daytona volume id/name: {e}")
+                    except Exception as e:
+                        logger.warning(f"Daytona volume.get(create=True) failed; will continue without pre-fetched id: {e}")
+
+                # First attempt: create sandbox mounting the known volume id
+                try:
+                    from daytona import CreateSandboxFromSnapshotParams, VolumeMount  # type: ignore
+                    params = CreateSandboxFromSnapshotParams(
+                        volumes=[VolumeMount(volumeId=conv_volume_id, mountPath=mount_dir)],
+                    )
+                    self.sandbox = self._daytona.create(params)
+                    logger.info(f"sandbox created: {self.sandbox}")
+                    created_with_volume = True
+                    logger.info(
+                        f"DaytonaSandboxClient.create: mounted existing volume for conversation={conversation_id}, volume_id={conv_volume_id}, mount_dir={mount_dir}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Create with existing volume failed, will try creating a new volume: {e}")
+                    # Second attempt can be implemented here if desired
+                        # Second attempt: create a brand new volume and mount
+            except Exception as e:
+                logger.warning(f"Daytona volume mounting path failed entirely; will proceed without volume: {e}")
+
+        # If volume mounting didn't work, create sandbox without volume and optionally sync initial artifacts
+        if not created_with_volume:
+            try:
+                # Fallback: simple sandbox creation without explicit volume mounts
+
+                self.sandbox = self._daytona.create()
+                logger.info("DaytonaSandboxClient.create: created sandbox without mounted volume; will sync artifacts if any")
+            except Exception as e:
+                raise RuntimeError(f"Failed to create Daytona sandbox: {e}")
+
+        # Ensure work_dir exists and is set on client
         self._work_dir = cfg.work_dir or "/home/daytona/workspace"
-        # Ensure workspace directory exists inside sandbox
         try:
-            # Try Daytona FS API first
-            res = self.sandbox.fs.create_folder(self._work_dir, "755")
-            if hasattr(res, "__await__"):
-                await res
-        except Exception:
-            # Fallback to shell mkdir/chmod
-            await self.run_command(f"mkdir -p {shlex.quote(self._work_dir)} && chmod 755 {shlex.quote(self._work_dir)}")
-        # Track current conversation for potential per-conversation behavior; preserve if None
-        if conversation_id is not None:
-            self._conversation_id = conversation_id
+            logger.info(f"try creating working dir {self._work_dir}")
+            await self.run_command(f"mkdir -p {shlex.quote(self._work_dir)} && chmod -R 777 {shlex.quote(self._work_dir)}")
+        except Exception as e:
+            logger.warning(f"Failed to prepare work_dir in sandbox: {e}")
+
+        # If no volume mount was used, sync any existing FileArtifact contents into sandbox
+        try:
+            if not created_with_volume and conversation_id:
+                logger.info(f"No Volume in sandbox, try to syncing artifacts for conversation to sandbox: {conversation_id}")
+                from app.models import FileArtifact
+                from asgiref.sync import sync_to_async
+                qs = FileArtifact.objects.filter(conversation_id=conversation_id).only("path", "stored_content")
+                artifacts = await sync_to_async(list)(qs)
+                logger.info(f"syncing {len(artifacts)} artifacts for conversation {conversation_id} to sandbox")
+                if artifacts:
+                    for fa in artifacts:
+                        path = getattr(fa, "path", None)
+                        data = getattr(fa, "stored_content", None)
+                        if path and data:
+                            # Map path to workspace dir to keep consistency
+                            spath = self._map_to_workspace(str(path))
+                            try:
+                                await self.write_file(spath, str(data))
+                            except Exception as e:
+                                logger.warning(f"Failed to seed artifact into sandbox: {path}: {e}")
+        except Exception as e:
+            # Non-fatal if ORM not ready
+            logger.info(f"No artifacts to seed or failed to seed due to: {e}")
 
     async def run_command(self, command: str, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> str:
         """Execute a shell command in the sandbox, anchored to the configured work_dir.
@@ -395,6 +497,13 @@ class DaytonaSandboxClient(BaseSandboxClient):
             b64 = base64.b64encode(data).decode("ascii")
             cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
             await self.run_command(cmd)
+        # Post-write diagnostics: existence and size
+        try:
+            exists_flag = await self.run_command(f"test -e {shlex.quote(spath)} && echo EXISTS || echo MISSING")
+            size_info = await self.run_command(f"wc -c < {shlex.quote(spath)} || echo NA")
+            logger.info(f"DaytonaSandboxClient.write_file: path={spath} exists={exists_flag.strip()} size_bytes={(size_info or '').strip()}")
+        except Exception as e:
+            logger.warning(f"DaytonaSandboxClient.write_file: failed to verify write for {spath}: {e}")
 
     async def read_file(self, path: str) -> str:
         if not self.sandbox:
