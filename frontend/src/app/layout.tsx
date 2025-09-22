@@ -37,7 +37,9 @@ export default function RootLayout({
                   </SignInButton>
                 </SignedOut>
                 <SignedIn>
-                  <UserButton afterSignOutUrl="/" />
+                  <div suppressHydrationWarning>
+                    <UserButton afterSignOutUrl="/" />
+                  </div>
                 </SignedIn>
               </div>
             </div>

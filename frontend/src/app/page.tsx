@@ -203,7 +203,7 @@ export default function Home() {
               className="min-h-[72px] resize-none border-none bg-transparent p-0 text-base focus-visible:ring-0 focus-visible:ring-offset-0"
             />
           </div>
-          <div className="flex items-center justify-between gap-4 border-t px-5 pb-5 pt-3">
+          <div className="flex items-center justify-between gap-4 px-5 pb-5 pt-3">
             <p className="text-xs text-muted-foreground">
               Tekan Enter untuk mengirim - Gunakan Shift + Enter untuk baris baru
             </p>

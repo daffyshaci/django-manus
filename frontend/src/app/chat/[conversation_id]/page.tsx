@@ -5,6 +5,8 @@ import { useParams, useRouter } from "next/navigation";
 import { useAuth } from "@clerk/nextjs";
 import { useRestFetch } from "@/lib/client/useRestFetch";
 import { useConversationWS } from "@/lib/client/ws";
+import { FragmentProvider, useFragment } from "@/contexts/FragmentContext";
+import { Fragment } from "@/components/Fragment";
 // Replace custom rendering with ai-elements
 import {
   Conversation,
@@ -140,7 +142,7 @@ function getToolName(tc: ToolCall): string {
   // Try to get name from function.name first (most common case)
   const functionName = (tc as any)?.function?.name;
   if (functionName) return functionName.toString();
-  
+
   // Fallback to other possible name fields
   const name = (tc.name || tc.tool_name || "").toString();
   return name || "unknown";
@@ -198,17 +200,18 @@ const models = [
     { id: 'claude-opus-4-20250514', name: 'Claude 4 Opus' },
   ];
 
-export default function ChatPage() {
+function ConversationPageContent() {
   const params = useParams();
   const router = useRouter();
-  const { isSignedIn, getToken: clerkGetToken } = useAuth();
+  const { isSignedIn, userId, getToken } = useAuth();
+  const { openFragment } = useFragment();
   const conversationId = useMemo(() => {
     const raw = params?.["conversation_id"];
     return Array.isArray(raw) ? raw[0] : (raw as string);
   }, [params]);
 
   const { restFetch } = useRestFetch({
-    getToken: async () => (await clerkGetToken?.({ template: "manus" })) ?? null,
+    getToken: async () => (await getToken?.({ template: "manus" })) ?? (await getToken?.()) ?? null,
   });
 
   const [model, setModel] = useState(models[0].id);
@@ -219,62 +222,89 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [agentBusy, setAgentBusy] = useState(false);
+  const [thinkingText, setThinkingText] = useState<string | null>(null);
+
+  type FileArtifactSchema = {
+    id: string;
+    path: string;
+    filename: string;
+    size_bytes: number;
+    sha256: string;
+    mime_type: string;
+    stored_content: string;
+    created_at?: string | null;
+    updated_at?: string | null;
+  };
+
+  type TreeNode = { name: string; path: string; children?: TreeNode[]; file?: FileArtifactSchema };
+  const [files, setFiles] = useState<FileArtifactSchema[]>([]);
+  const [fileTree, setFileTree] = useState<TreeNode[]>([]);
+  const [selectedFile, setSelectedFile] = useState<FileArtifactSchema | null>(null);
+  const [selectedContent, setSelectedContent] = useState<string>("");
 
   const THINKING_ID = "__thinking__";
   function upsertThinking(show: boolean, text: string = "Agent thinking...") {
     if (!conversationId) return;
     if (show) {
-      setMessages((prev) => {
-        if (prev.some((m) => m.id === THINKING_ID)) return prev;
-        const temp: MessageSchema = {
-          id: THINKING_ID,
-          conversation_id: conversationId,
-          role: "assistant",
-          content: text,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-        const next = [...prev, temp];
-        next.sort((a, b) => {
-          const ta = a.created_at ? Date.parse(a.created_at) : 0;
-          const tb = b.created_at ? Date.parse(b.created_at) : 0;
-          return ta - tb;
-        });
-        return next;
-      });
+      setThinkingText(text);
     } else {
-      setMessages((prev) => prev.filter((m) => m.id !== THINKING_ID));
+      setThinkingText(null);
     }
   }
 
-  // Initial fetch conversation detail + messages
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!conversationId) return;
-      try {
-        setLoading(true);
-        setError(null);
-        const detail = await restFetch<ConversationDetailSchema>(`/v1/chat/conversations/${conversationId}`);
-        if (!mounted) return;
-        setConversation(detail.conversation);
-        setMessages((detail.messages || []));
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(msg);
-      } finally {
-        setLoading(false);
+  const buildFileTree = useCallback((artifacts: FileArtifactSchema[]): TreeNode[] => {
+    const root: Record<string, TreeNode> = {};
+    for (const f of artifacts) {
+      const parts = (f.path || f.filename).split("/").filter(Boolean);
+      let curMap = root;
+      let curPath = "";
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        curPath = curPath ? `${curPath}/${part}` : part;
+        if (!curMap[part]) curMap[part] = { name: part, path: curPath, children: [] };
+        if (i === parts.length - 1) curMap[part].file = f;
+        if (curMap[part].children) {
+          const nextMap: Record<string, TreeNode> = {};
+          for (const child of curMap[part].children!) nextMap[child.name] = child;
+          curMap = nextMap;
+          curMap[part] = curMap[part] || { name: part, path: curPath, children: [] };
+        }
       }
-    })();
-    return () => {
-      mounted = false;
+    }
+    const toArray = (map: Record<string, TreeNode>): TreeNode[] => {
+      const arr = Object.values(map);
+      for (const node of arr) if (node.children && node.children.length) node.children = toArray(Object.fromEntries(node.children.map(c => [c.name, c])));
+      return arr.sort((a, b) => a.name.localeCompare(b.name));
     };
+    return toArray(root);
+  }, []);
+
+  const fetchFiles = useCallback(async () => {
+    if (!conversationId) return;
+    try {
+      const data = await restFetch<FileArtifactSchema[]>(`/v1/chat/conversations/${conversationId}/files`);
+      setFiles(data || []);
+    } catch {}
   }, [conversationId, restFetch]);
 
-  // WebSocket for realtime updates
+  useEffect(() => {
+    if (!files) return;
+    const tree = buildFileTree(files);
+    setFileTree(tree);
+    if (selectedFile) {
+      const match = files.find(f => f.id === selectedFile.id);
+      if (match) setSelectedContent(match.stored_content || "");
+    }
+  }, [files, buildFileTree]);
+
+  useEffect(() => {
+    fetchFiles();
+  }, [fetchFiles]);
+
+  // ... existing code ...
   useConversationWS({
     conversationId: conversationId || "",
-    getToken: async () => (await clerkGetToken?.({ template: "manus" })) ?? null,
+    getToken: async () => (await getToken?.({ template: "manus" })) ?? (await getToken?.()) ?? null,
     onMessage: (data) => {
 
       const eventName =
@@ -282,22 +312,18 @@ export default function ChatPage() {
           ? ((data as any).event as string)
           : undefined;
 
-      if (eventName === "agent.thoughts.start" || eventName === "agent.tools_prepared" || eventName === "agent.tool_result") {
+      if (eventName === "agent.thoughts.start" || eventName === "agent.tools_prepared") {
         setAgentBusy(true);
         upsertThinking(true);
       }
-      if (eventName === "agent.finished" || eventName === "agent.thoughts.finish") {
+      if (eventName === "agent.finished") {
         setAgentBusy(false);
         upsertThinking(false);
+        fetchFiles();
       }
 
       const msg = extractMessageFromWS(data);
       if (msg && msg.conversation_id === conversationId) {
-        // On real assistant/user message, replace thinking with actual content
-        upsertThinking(false);
-        setAgentBusy(true);
-
-        // Check if this message contains terminate tool call
         const hasTerminateTool = msg.tool_calls && Array.isArray(msg.tool_calls) &&
           msg.tool_calls.some((tc: any) => {
             const toolName = tc?.function?.name || tc?.name || tc?.tool_name;
@@ -305,25 +331,55 @@ export default function ChatPage() {
           });
 
         setMessages((prev) => {
-          // Avoid duplicates by id
           if (prev.some((m) => m.id === msg.id)) return prev;
-          const next = [...prev, msg];
+          let next = [...prev];
+          if (msg.role === "user") {
+            next = next.filter((m) => !m.id.startsWith("temp-") || m.role !== "user");
+          }
+          next.push(msg);
           next.sort((a, b) => {
             const ta = a.created_at ? Date.parse(a.created_at) : 0;
             const tb = b.created_at ? Date.parse(b.created_at) : 0;
             return ta - tb;
           });
-          console.log(next)
           return next;
         });
 
-        // If terminate tool is called, stop thinking and set agent as not busy
+        if (Array.isArray(msg.tool_calls)) {
+          for (const tc of msg.tool_calls as any[]) {
+            const tname = tc?.function?.name || tc?.name || tc?.tool_name;
+            if (tname === 'file_editor') {
+              const args = tc?.arguments ?? tc?.args;
+              const parsedArgs = typeof args === 'string' ? tryParseJSON(args) : args;
+              if (parsedArgs?.file_text) {
+                const fileName = parsedArgs.path || 'file.txt';
+                const fileExtension = fileName.split('.').pop() || 'txt';
+                openFragment({
+                  id: tc?.id || `${msg.id}-tc-fe`,
+                  title: fileName,
+                  content: parsedArgs.file_text,
+                  language: getLanguageFromExtension(fileExtension),
+                  path: parsedArgs.path,
+                });
+                setSelectedFile({
+                  id: tc?.id || `${msg.id}-tc-fe`,
+                  path: parsedArgs.path || fileName,
+                  filename: fileName,
+                  size_bytes: 0,
+                  sha256: "",
+                  mime_type: "text/plain",
+                  stored_content: parsedArgs.file_text,
+                });
+                setSelectedContent(parsedArgs.file_text);
+                fetchFiles();
+              }
+            }
+          }
+        }
+
         if (hasTerminateTool) {
           setAgentBusy(false);
           upsertThinking(false);
-        } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
-          // Show thinking for assistant messages with tool calls (but not terminate)
-          upsertThinking(true);
         }
       }
     },
@@ -339,7 +395,6 @@ export default function ChatPage() {
     if (!content) return;
 
     try {
-      // Optimistic append user message (without real id)
       const temp: MessageSchema = {
         id: `temp-${Date.now()}`,
         conversation_id: conversationId,
@@ -350,7 +405,7 @@ export default function ChatPage() {
       };
       setMessages((prev) => [...prev, temp]);
       setAgentBusy(true);
-      upsertThinking(true);
+      upsertThinking(true, "Agent thinking...");
 
       // Build request body, include first image (optional) as base64 if available
       let base64_image: string | undefined = undefined;
@@ -392,10 +447,31 @@ export default function ChatPage() {
     );
   }
 
+  if (loading) {
+    return (
+      <div className="flex h-[600px] items-center justify-center">
+        <Loader />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-[600px] items-center justify-center">
+        <div className="text-center">
+          <p className="text-red-500 mb-2">Error loading conversation</p>
+          <p className="text-sm text-gray-600">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="max-w-4xl mx-auto p-6 h-[600px]">
-      <div className="flex flex-col justify-between h-full">
-        <Conversation>
+    <div className="flex h-[600px]">
+      {/* Chat Section */}
+      <div className="flex-1 max-w-4xl mx-auto p-6">
+        <div className="flex flex-col justify-between h-full">
+          <Conversation>
           <ConversationContent>
             {messages.length === 0 ? (
               <ConversationEmptyState
@@ -410,24 +486,10 @@ export default function ChatPage() {
                 return (
                   <>
                     {messages.map((message) => {
-                      // Skip standalone tool messages: tool results are attached under their assistant tool_calls
                       if (message.role === 'tool') {
-                        // If some tool message slips in without matching assistant tool_call, we still skip per new UI requirements
                         return null;
                       }
 
-                      // Render thinking message with animation
-                      if (message.id === THINKING_ID) {
-                        return (
-                          <AiMessage key={message.id} from="assistant">
-                            <MessageContent>
-                              <ThinkingAnimation variant="dots" size="md" />
-                            </MessageContent>
-                          </AiMessage>
-                        );
-                      }
-
-                      // For regular user/assistant/system messages
                       const from = (message.role === 'user' || message.role === 'assistant') ? message.role : 'assistant';
 
                       const toolCalls = normalizeToolCalls(message.tool_calls);
@@ -435,7 +497,6 @@ export default function ChatPage() {
                       const hasText = hasNonEmptyText(message.content);
                       const hasImage = !!message.base64_image;
 
-                      // Skip whole message if no visible content (no text, no image, no tools)
                       if (!hasToolCalls && !hasText && !hasImage) {
                         return null;
                       }
@@ -464,7 +525,6 @@ export default function ChatPage() {
                             </AiMessage>
                           )}
 
-                          {/* Render tool calls with Tool UI (skip tool 'terminat') */}
                           {hasToolCalls && (
                             <div className="space-y-2">
                               {toolCalls.map((tc, idx) => {
@@ -473,92 +533,117 @@ export default function ChatPage() {
                                 if (toolName === 'terminate') return null;
                                 const outputMsg = callId && toolResults.get(String(callId));
 
-                                // Map states to ToolUIPart states - fix status progression
-                                const toolState: "input-streaming" | "input-available" | "output-available" | "output-error" =
-                                  outputMsg ? "output-available" : "input-available";
-
-                                // Extract common args for display
-                                const args = (tc as any)?.arguments ?? (tc as any)?.args;
-                                const parsedArgs = typeof args === 'string' ? tryParseJSON(args) : args;
+                                const handleFragmentClick = () => {
+                                  if (toolName === 'file_editor') {
+                                    const args = (tc as any)?.arguments ?? (tc as any)?.args;
+                                    const parsedArgs = typeof args === 'string' ? tryParseJSON(args) : args;
+                                    if (parsedArgs?.file_text) {
+                                      const fileName = parsedArgs.path || 'file.txt';
+                                      const fileExtension = fileName.split('.').pop() || 'txt';
+                                      openFragment({
+                                        id: callId || `${message.id}-tc-${idx}`,
+                                        title: fileName,
+                                        content: parsedArgs.file_text,
+                                        language: getLanguageFromExtension(fileExtension),
+                                        path: parsedArgs.path,
+                                      });
+                                      setSelectedFile({
+                                        id: callId || `${message.id}-tc-${idx}`,
+                                        path: parsedArgs.path || fileName,
+                                        filename: fileName,
+                                        size_bytes: 0,
+                                        sha256: "",
+                                        mime_type: "text/plain",
+                                        stored_content: parsedArgs.file_text,
+                                      });
+                                      setSelectedContent(parsedArgs.file_text);
+                                      fetchFiles();
+                                    }
+                                  }
+                                };
 
                                 return (
-                                  <Tool key={`${message.id}-tc-${idx}`} className="w-full">
-                                    <ToolHeader
-                                      type={toolName as const}
-                                      state={toolState}
-                                    />
-                                    <ToolContent>
-                                      {/* Show input parameters */}
-                                      {parsedArgs && (
-                                        <ToolInput input={parsedArgs} />
-                                      )}
-
-                                      {/* Show output if available */}
-                                      {outputMsg && (
-                                        <ToolOutput
-                                          output={outputMsg.content}
-                                          errorText={undefined}
-                                        />
-                                      )}
-                                    </ToolContent>
-                                  </Tool>
+                                  <ToolCallUI key={callId || `${message.id}-${idx}`}
+                                    toolName={toolName}
+                                    callId={callId}
+                                    outputMessage={outputMsg}
+                                    onOpenFragment={handleFragmentClick}
+                                  />
                                 );
                               })}
                             </div>
                           )}
                         </div>
                       );
-                     })}
+                    })}
+                    {agentBusy && thinkingText ? (
+                      <AiMessage key={THINKING_ID} from="assistant">
+                        <MessageContent>
+                          <ThinkingAnimation variant="dots" size="md" />
+                        </MessageContent>
+                      </AiMessage>
+                    ) : null}
                   </>
                 );
               })()
             )}
           </ConversationContent>
-          <ConversationScrollButton />
-        </Conversation>
+          </Conversation>
+        </div>
+      </div>
 
-        <PromptInput onSubmit={handlePromptSubmit} className="mt-4" globalDrop multiple>
-          <PromptInputBody>
-            <PromptInputAttachments>
-              {(attachment) => <PromptInputAttachment data={attachment} />}
-            </PromptInputAttachments>
-            <PromptInputTextarea
-              onChange={(e) => setInput(e.target.value)}
-              value={input}
-              disabled={agentBusy}
-              placeholder={agentBusy ? "Agent is processing..." : "What would you like to know?"}
-            />
-          </PromptInputBody>
-          <PromptInputToolbar>
-            <PromptInputTools>
-              <PromptInputActionMenu>
-                <PromptInputActionMenuTrigger />
-                <PromptInputActionMenuContent>
-                  <PromptInputActionAddAttachments />
-                </PromptInputActionMenuContent>
-              </PromptInputActionMenu>
-              <PromptInputModelSelect
-                onValueChange={(value: string) => {
-                  setModel(value);
-                }}
-                value={model}
-              >
-                <PromptInputModelSelectTrigger>
-                  <PromptInputModelSelectValue />
-                </PromptInputModelSelectTrigger>
-                <PromptInputModelSelectContent>
-                  {models.map((model) => (
-                    <PromptInputModelSelectItem key={model.id} value={model.id}>
-                      {model.name}
-                    </PromptInputModelSelectItem>
-                  ))}
-                </PromptInputModelSelectContent>
-              </PromptInputModelSelect>
-            </PromptInputTools>
-            <PromptInputSubmit disabled={!input && !loading || agentBusy} />
-          </PromptInputToolbar>
-        </PromptInput>
+      <div className="w-[600px] border-l p-4 flex flex-col">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-sm font-medium">Sandbox Files</div>
+          <button className="text-xs underline" onClick={() => fetchFiles()}>Refresh</button>
+        </div>
+        <div className="flex min-h-0 flex-1 gap-3">
+          <div className="w-1/2 overflow-auto border rounded p-2">
+            {fileTree.length ? renderTree(fileTree) : <div className="text-xs text-muted-foreground">No files</div>}
+          </div>
+          <div className="w-1/2 overflow-auto border rounded p-2">
+            {selectedFile ? (
+              <div>
+                <div className="text-sm font-semibold mb-2">{selectedFile.filename}</div>
+                <pre className="whitespace-pre-wrap text-xs">{selectedContent}</pre>
+              </div>
+            ) : (
+              <div className="text-xs text-muted-foreground">Select a file to view</div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )
+}
+
+// Helper function to get language from file extension
+function getLanguageFromExtension(extension: string): string {
+  const languageMap: Record<string, string> = {
+    'js': 'javascript',
+    'jsx': 'javascript',
+    'ts': 'typescript',
+    'tsx': 'typescript',
+    'py': 'python',
+    'html': 'html',
+    'css': 'css',
+    'json': 'json',
+    'md': 'markdown',
+    'yml': 'yaml',
+    'yaml': 'yaml',
+    'xml': 'xml',
+    'sql': 'sql',
+    'sh': 'bash',
+    'bash': 'bash',
+  };
+  return languageMap[extension.toLowerCase()] || 'text';
+}
+
+export default function ConversationPage() {
+  return (
+    <FragmentProvider>
+      <ConversationPageContent />
+      <Fragment />
+    </FragmentProvider>
+  );
 }
