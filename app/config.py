@@ -114,6 +114,11 @@ class SandboxSettings(BaseModel):
     network_enabled: bool = Field(
         False, description="Whether network access is allowed"
     )
+    # NEW: control sandbox lifecycle across agent.run invocations
+    keep_alive: bool = Field(
+        False,
+        description="If true, do not automatically cleanup sandbox at the end of agent.run; intended to persist the sandbox across multiple steps/flows in the same conversation.",
+    )
 
     # Daytona-specific optional configuration (can also be set via environment variables)
     api_key: Optional[str] = Field(
@@ -308,6 +313,7 @@ class Config:
             cpu_limit=float(dj_get("SANDBOX_CPU_LIMIT", 1.0)),
             timeout=int(dj_get("SANDBOX_TIMEOUT", 300)),
             network_enabled=bool(dj_get("SANDBOX_NETWORK_ENABLED", True)),
+            keep_alive=bool(dj_get("SANDBOX_KEEP_ALIVE", False)),
             api_key=dj_get("DAYTONA_API_KEY", None),
             api_url=dj_get("DAYTONA_API_URL", None),
             target=dj_get("DAYTONA_TARGET", None),

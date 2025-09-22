@@ -9,6 +9,8 @@ from app.agent.manus import Manus
 from app.agent.data_analysis import DataAnalysis
 from app.logger import logger
 from app.models import Conversation
+from app.flow.flow_factory import FlowFactory, FlowType
+from app.config import config
 
 
 @shared_task(bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
@@ -61,11 +63,42 @@ def run_manus_agent(self, prompt: str, conversation_id: Optional[str] = None, ag
         pass
 
     async def _run() -> str:
-        # Pilih agent berdasarkan agent_type
+        # Jalan alternatif: gunakan Flow jika diminta
+        if agent_type == "agent_flow":
+            agents: Dict[str, Any] = {}
+            logger.info(f"Creating agents for PlanningFlow with kwargs: {kwargs}")
+            manus_agent = await Manus.create(**kwargs)
+            agents["manus"] = manus_agent
+            # Opsional tambahkan DataAnalysis agent dari konfigurasi
+            try:
+                if getattr(config, "run_flow_config", None) and config.run_flow_config.use_data_analysis_agent:
+                    data_agent = await DataAnalysis.create(**kwargs)
+                    agents["data_analysis"] = data_agent
+            except Exception as e:
+                logger.error(f"Failed to create optional data_analysis agent: {e}")
+
+            flow = FlowFactory.create_flow(
+                flow_type=FlowType.PLANNING,
+                agents=agents,
+            )
+            logger.warning("Processing your request via PlanningFlow...")
+            try:
+                # Untuk flow, tetap gunakan prompt sebagai input awal untuk pembuatan rencana
+                await asyncio.wait_for(flow.execute(prompt), timeout=3600)
+                logger.info("Request processing completed (flow).")
+                return "done"
+            finally:
+                # Pastikan semua agent dibersihkan
+                for a in agents.values():
+                    try:
+                        await a.cleanup()
+                    except Exception:
+                        pass
+
+        # Default: Pilih agent berdasarkan agent_type
         agent_class = Manus  # default
         if agent_type == "data_analysis":
             agent_class = DataAnalysis
-
 
         logger.info(f"Creating {agent_class.__name__} agent with kwargs: {kwargs}")
         agent = await agent_class.create(**kwargs)

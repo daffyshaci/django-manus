@@ -48,8 +48,10 @@ import {
 import { MessageSquare } from "lucide-react";
 import { Loader } from "@/components/ai-elements/loader";
 import { Response } from "@/components/ai-elements/response";
-import { Task, TaskContent, TaskItem, TaskItemFile, TaskTrigger } from "@/components/ai-elements/task";
+
 import { Button } from "@/components/ui/button";
+import { Image } from "@/components/ai-elements/image";
+import { ThinkingAnimation } from "@/components/ai-elements/thinking-animation";
 
 // Types aligned with backend app/api.py schemas
 // ConversationSchema -> { id, title, llm_model }
@@ -72,6 +74,16 @@ interface MessageSchema {
   updated_at?: string | null;
 }
 
+// Minimal ToolCall shape expected from backend/LLM for assistant tool_calls
+// We keep fields optional to be resilient to backend differences
+export type ToolCall = {
+  id?: string;
+  name?: string;
+  tool_name?: string;
+  type?: string;
+  arguments?: unknown;
+  args?: unknown;
+};
 interface ConversationDetailSchema {
   conversation: ConversationSchema;
   messages: MessageSchema[];
@@ -118,6 +130,69 @@ function extractMessageFromWS(data: unknown): MessageSchema | null {
   return null;
 }
 
+// Normalize tool_calls of assistant message into typed array
+function normalizeToolCalls(toolCalls: MessageSchema["tool_calls"]): ToolCall[] {
+  if (!Array.isArray(toolCalls)) return [];
+  return toolCalls.map((tc) => tc as unknown as ToolCall);
+}
+
+function getToolName(tc: ToolCall): string {
+  // Try to get name from function.name first (most common case)
+  const functionName = (tc as any)?.function?.name;
+  if (functionName) return functionName.toString();
+  
+  // Fallback to other possible name fields
+  const name = (tc.name || tc.tool_name || "").toString();
+  return name || "unknown";
+}
+
+function pretty(value: unknown): string {
+  try {
+    return typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function hasNonEmptyText(text: unknown): boolean {
+  return typeof text === "string" && text.trim().length > 0;
+}
+
+function tryParseJSON<T = unknown>(text: string | null | undefined): T | string | null {
+  if (!text) return text ?? null;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return text;
+  }
+}
+
+// Build a lookup of tool result messages keyed by tool_call_id
+// so we can attach ToolOutput to corresponding ToolInput
+// This is recomputed when messages change
+const toolResultByCallIdSelector = (messages: MessageSchema[]) => {
+  const map = new Map<string, MessageSchema>();
+  for (const m of messages) {
+    if (m.role === "tool" && m.tool_call_id && !map.has(m.tool_call_id)) {
+      map.set(m.tool_call_id, m);
+    }
+  }
+  return map;
+};
+
+// Collect assistant tool_call ids to avoid rendering duplicate standalone tool messages
+const assistantToolCallIdsSelector = (messages: MessageSchema[]) => {
+  const set = new Set<string>();
+  for (const m of messages) {
+    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        const id = (tc as any)?.id;
+        if (id) set.add(String(id));
+      }
+    }
+  }
+  return set;
+};
 const models = [
     { id: 'gpt-4o', name: 'GPT-4o' },
     { id: 'claude-opus-4-20250514', name: 'Claude 4 Opus' },
@@ -211,16 +286,24 @@ export default function ChatPage() {
         setAgentBusy(true);
         upsertThinking(true);
       }
-      if (eventName === "agent.finished") {
+      if (eventName === "agent.finished" || eventName === "agent.thoughts.finish") {
         setAgentBusy(false);
         upsertThinking(false);
       }
 
       const msg = extractMessageFromWS(data);
       if (msg && msg.conversation_id === conversationId) {
-        // On real assistant/user message, replace thinking with actual content, then keep thinking if agent continues
+        // On real assistant/user message, replace thinking with actual content
         upsertThinking(false);
         setAgentBusy(true);
+
+        // Check if this message contains terminate tool call
+        const hasTerminateTool = msg.tool_calls && Array.isArray(msg.tool_calls) &&
+          msg.tool_calls.some((tc: any) => {
+            const toolName = tc?.function?.name || tc?.name || tc?.tool_name;
+            return toolName === 'terminate';
+          });
+
         setMessages((prev) => {
           // Avoid duplicates by id
           if (prev.some((m) => m.id === msg.id)) return prev;
@@ -233,8 +316,15 @@ export default function ChatPage() {
           console.log(next)
           return next;
         });
-        // Show thinking again until finished if backend continues processing
-        upsertThinking(true);
+
+        // If terminate tool is called, stop thinking and set agent as not busy
+        if (hasTerminateTool) {
+          setAgentBusy(false);
+          upsertThinking(false);
+        } else if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+          // Show thinking for assistant messages with tool calls (but not terminate)
+          upsertThinking(true);
+        }
       }
     },
   });
@@ -314,35 +404,115 @@ export default function ChatPage() {
                 description="Type a message below to begin chatting"
               />
             ) : (
-              messages.map((message) => (
-                <AiMessage from={message.role as 'system' | 'user' | 'assistant'} key={message.id}>
-                  <MessageContent variant="flat">
-                    <Response>
-                      {message.id === THINKING_ID ? (
-                        <Loader />
-                      ) : (
-                        message.content ?? ""
-                      )}
-                    </Response>
-                  </MessageContent>
-                </AiMessage>
-              ))
+              (() => {
+                const toolResults = toolResultByCallIdSelector(messages);
+                const assistantToolCallIds = assistantToolCallIdsSelector(messages);
+                return (
+                  <>
+                    {messages.map((message) => {
+                      // Skip standalone tool messages: tool results are attached under their assistant tool_calls
+                      if (message.role === 'tool') {
+                        // If some tool message slips in without matching assistant tool_call, we still skip per new UI requirements
+                        return null;
+                      }
+
+                      // Render thinking message with animation
+                      if (message.id === THINKING_ID) {
+                        return (
+                          <AiMessage key={message.id} from="assistant">
+                            <MessageContent>
+                              <ThinkingAnimation variant="dots" size="md" />
+                            </MessageContent>
+                          </AiMessage>
+                        );
+                      }
+
+                      // For regular user/assistant/system messages
+                      const from = (message.role === 'user' || message.role === 'assistant') ? message.role : 'assistant';
+
+                      const toolCalls = normalizeToolCalls(message.tool_calls);
+                      const hasToolCalls = toolCalls.length > 0 && message.role === 'assistant';
+                      const hasText = hasNonEmptyText(message.content);
+                      const hasImage = !!message.base64_image;
+
+                      // Skip whole message if no visible content (no text, no image, no tools)
+                      if (!hasToolCalls && !hasText && !hasImage) {
+                        return null;
+                      }
+
+                      return (
+                        <div key={message.id}>
+                          {(hasText || hasImage) && (
+                            <AiMessage from={from}>
+                              <MessageContent variant="flat">
+                                {hasText ? (
+                                  <Response>
+                                    {message.content as string}
+                                  </Response>
+                                ) : null}
+                                {hasImage ? (
+                                  <div className="mt-2">
+                                    <Image
+                                      base64={message.base64_image as string}
+                                      uint8Array={new Uint8Array(0)}
+                                      mediaType="image/png"
+                                      alt="attachment"
+                                    />
+                                  </div>
+                                ) : null}
+                              </MessageContent>
+                            </AiMessage>
+                          )}
+
+                          {/* Render tool calls with Tool UI (skip tool 'terminat') */}
+                          {hasToolCalls && (
+                            <div className="space-y-2">
+                              {toolCalls.map((tc, idx) => {
+                                const callId = (tc as any)?.id ?? null;
+                                const toolName = getToolName(tc);
+                                if (toolName === 'terminate') return null;
+                                const outputMsg = callId && toolResults.get(String(callId));
+
+                                // Map states to ToolUIPart states - fix status progression
+                                const toolState: "input-streaming" | "input-available" | "output-available" | "output-error" =
+                                  outputMsg ? "output-available" : "input-available";
+
+                                // Extract common args for display
+                                const args = (tc as any)?.arguments ?? (tc as any)?.args;
+                                const parsedArgs = typeof args === 'string' ? tryParseJSON(args) : args;
+
+                                return (
+                                  <Tool key={`${message.id}-tc-${idx}`} className="w-full">
+                                    <ToolHeader
+                                      type={toolName as const}
+                                      state={toolState}
+                                    />
+                                    <ToolContent>
+                                      {/* Show input parameters */}
+                                      {parsedArgs && (
+                                        <ToolInput input={parsedArgs} />
+                                      )}
+
+                                      {/* Show output if available */}
+                                      {outputMsg && (
+                                        <ToolOutput
+                                          output={outputMsg.content}
+                                          errorText={undefined}
+                                        />
+                                      )}
+                                    </ToolContent>
+                                  </Tool>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                     })}
+                  </>
+                );
+              })()
             )}
-            {/* Removed extra loader; thinking shown as a message */}
-            <Task className="w-full">
-              {/* <TaskTrigger title="Found project files" /> */}
-              <TaskContent>
-                <TaskItem>
-                  Read <TaskItemFile
-                    onClick={() => {
-                      window.open('/chat/' + conversationId + '/index.md', '_blank');
-                    }}
-                  >
-                      index.md
-                  </TaskItemFile>
-                </TaskItem>
-              </TaskContent>
-            </Task>
           </ConversationContent>
           <ConversationScrollButton />
         </Conversation>
@@ -355,6 +525,8 @@ export default function ChatPage() {
             <PromptInputTextarea
               onChange={(e) => setInput(e.target.value)}
               value={input}
+              disabled={agentBusy}
+              placeholder={agentBusy ? "Agent is processing..." : "What would you like to know?"}
             />
           </PromptInputBody>
           <PromptInputToolbar>
@@ -383,7 +555,7 @@ export default function ChatPage() {
                 </PromptInputModelSelectContent>
               </PromptInputModelSelect>
             </PromptInputTools>
-            <PromptInputSubmit disabled={!input && !loading} />
+            <PromptInputSubmit disabled={!input && !loading || agentBusy} />
           </PromptInputToolbar>
         </PromptInput>
       </div>

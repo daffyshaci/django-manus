@@ -97,6 +97,8 @@ class DaytonaSandboxClient(BaseSandboxClient):
         self._daytona: Optional[Any] = None
         self._work_dir: Optional[str] = None
         self._conversation_id: Optional[str] = None
+        # Track which conversation the current sandbox was actually created for
+        self._sandbox_conv_id: Optional[str] = None
 
     def _map_to_workspace(self, path: str) -> str:
         """Map any incoming path to a POSIX path within the sandbox work_dir.
@@ -181,7 +183,9 @@ class DaytonaSandboxClient(BaseSandboxClient):
         self._daytona = Daytona(dcfg)
         assert self._daytona is not None
         # set conversation context early for later helpers
-        self._conversation_id = conversation_id
+        # Fallback to existing attribute if param not provided
+        conv_id = conversation_id or getattr(self, "_conversation_id", None)
+        self._conversation_id = conv_id
 
         # Decide mount dir upfront
         mount_dir = cfg.work_dir or "/home/daytona/workspace"
@@ -191,13 +195,13 @@ class DaytonaSandboxClient(BaseSandboxClient):
         conv = None
         conv_volume_id = None
         conv_volume_name = None
-        if conversation_id:
+        if conv_id:
             try:
                 # Fetch conversation and known volume info
                 from app.models import Conversation
-                conv = await Conversation.objects.aget(id=conversation_id)
+                conv = await Conversation.objects.aget(id=conv_id)
                 conv_volume_id = getattr(conv, "daytona_volume_id", None)
-                conv_volume_name = getattr(conv, "daytona_volume_name", None) or f"manus-{conversation_id}"
+                conv_volume_name = getattr(conv, "daytona_volume_name", None) or f"manus-{conv_id}"
 
                 # Ensure a volume exists if id missing: get or create by name
                 if not conv_volume_id:
@@ -248,7 +252,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
                     logger.info(f"sandbox created: {self.sandbox}")
                     created_with_volume = True
                     logger.info(
-                        f"DaytonaSandboxClient.create: mounted existing volume for conversation={conversation_id}, volume_id={conv_volume_id}, mount_dir={mount_dir}"
+                        f"DaytonaSandboxClient.create: mounted existing volume for conversation={conv_id}, volume_id={conv_volume_id}, mount_dir={mount_dir}"
                     )
                 except Exception as e:
                     logger.warning(f"Create with existing volume failed, will try creating a new volume: {e}")
@@ -277,13 +281,14 @@ class DaytonaSandboxClient(BaseSandboxClient):
 
         # If no volume mount was used, sync any existing FileArtifact contents into sandbox
         try:
-            if not created_with_volume and conversation_id:
-                logger.info(f"No Volume in sandbox, try to syncing artifacts for conversation to sandbox: {conversation_id}")
+            if not created_with_volume and conv_id:
+                logger.info(f"No Volume in sandbox, try to syncing artifacts for conversation to sandbox: {conv_id}")
                 from app.models import FileArtifact
                 from asgiref.sync import sync_to_async
-                qs = FileArtifact.objects.filter(conversation_id=conversation_id).only("path", "stored_content")
+                # Filter by Conversation UUID field, not PK, to avoid pkid type mismatch
+                qs = FileArtifact.objects.filter(conversation__id=conv_id).only("path", "stored_content")
                 artifacts = await sync_to_async(list)(qs)
-                logger.info(f"syncing {len(artifacts)} artifacts for conversation {conversation_id} to sandbox")
+                logger.info(f"syncing {len(artifacts)} artifacts for conversation {conv_id} to sandbox")
                 if artifacts:
                     for fa in artifacts:
                         path = getattr(fa, "path", None)
@@ -298,6 +303,8 @@ class DaytonaSandboxClient(BaseSandboxClient):
         except Exception as e:
             # Non-fatal if ORM not ready
             logger.info(f"No artifacts to seed or failed to seed due to: {e}")
+        # Record the conversation id this sandbox is associated with
+        self._sandbox_conv_id = conv_id
 
     async def run_command(self, command: str, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None) -> str:
         """Execute a shell command in the sandbox, anchored to the configured work_dir.
@@ -438,65 +445,60 @@ class DaytonaSandboxClient(BaseSandboxClient):
             except Exception:
                 # Last resort: plain cat (may corrupt binary). Best-effort.
                 out2 = await self.run_command(f"cat {shlex.quote(spath)} || true")
-                local_p.write_text(out2, encoding="utf-8")
+                try:
+                    local_p.write_text(out2, encoding="utf-8")
+                except Exception:
+                    # If binary, ignore errors
+                    pass
 
     async def copy_to(self, local_path: str, container_path: str) -> None:
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
         spath = self._map_to_workspace(container_path)
-        data = Path(local_path).read_bytes()
-        # Ensure parent dir exists
-        parent_dir = "/".join(spath.split("/")[:-1]) or (self._work_dir or "/home/daytona/workspace")
-        await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
-        # Handle possible SDK signature differences by trying both orders
+        # Try Daytona SDK first
         try:
-            result = self.sandbox.fs.upload_file(data, spath)
-        except TypeError:
-            result = self.sandbox.fs.upload_file(spath, data)
-        if hasattr(result, "__await__"):
-            await result
-        # Verify upload actually created the file; if not, fallback
-        try:
-            exists_out = await self.run_command(f"test -e {shlex.quote(spath)} && echo OK || echo NO")
-            if "OK" not in (exists_out or ""):
-                # Fallback to shell-based write
-                b64 = base64.b64encode(data).decode("ascii")
-                cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
-                await self.run_command(cmd)
+            data = Path(local_path).read_bytes()
+            resp = self.sandbox.fs.upload_file(spath, data)
+            if hasattr(resp, "__await__"):
+                await resp
+            return
         except Exception:
-            # Best-effort fallback
+            # Fallback to base64 via shell for reliability
+            data = Path(local_path).read_bytes()
             b64 = base64.b64encode(data).decode("ascii")
-            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
-            await self.run_command(cmd)
+            await self.run_command(f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)} && chmod 644 {shlex.quote(spath)}")
+
+    async def read_file(self, path: str) -> str:
+        if not self.sandbox:
+            raise RuntimeError("Sandbox not initialized")
+        spath = self._map_to_workspace(path)
+        # Try Daytona SDK
+        try:
+            content = self.sandbox.fs.read_text_file(spath)
+            if hasattr(content, "__await__"):
+                content = await content
+            if isinstance(content, (bytes, bytearray)):
+                return content.decode("utf-8", errors="ignore")
+            return str(content)
+        except Exception:
+            # Fallback to shell
+            return await self.run_command(f"cat {shlex.quote(spath)} || true")
 
     async def write_file(self, path: str, content: str) -> None:
         if not self.sandbox:
             raise RuntimeError("Sandbox not initialized")
         spath = self._map_to_workspace(path)
-        # Ensure parent dir exists
-        parent_dir = "/".join(spath.split("/")[:-1]) or self._work_dir
-        await self.run_command(f"mkdir -p {shlex.quote(parent_dir)}")
-        data = content.encode("utf-8")
-        # Try Daytona SDK first
+        # Try Daytona SDK
         try:
-            try:
-                result = self.sandbox.fs.upload_file(data, spath)
-            except TypeError:
-                result = self.sandbox.fs.upload_file(spath, data)
-            if hasattr(result, "__await__"):
-                await result
-            # Verify file exists; if not, fallback to shell write
-            exists_out = await self.run_command(f"test -e {shlex.quote(spath)} && echo OK || echo NO")
-            if "OK" not in (exists_out or ""):
-                b64 = base64.b64encode(data).decode("ascii")
-                cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
-                await self.run_command(cmd)
-            return
+            data = content.encode("utf-8")
+            resp = self.sandbox.fs.upload_file(spath, data)
+            if hasattr(resp, "__await__"):
+                await resp
         except Exception:
-            # Fallback: write via base64 through the shell to avoid bulk-upload endpoint issues
-            b64 = base64.b64encode(data).decode("ascii")
-            cmd = f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)}"
-            await self.run_command(cmd)
+            # Fallback to shell using base64 to preserve content
+            b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+            await self.run_command(f"echo {shlex.quote(b64)} | base64 -d > {shlex.quote(spath)} && chmod 644 {shlex.quote(spath)}")
+
         # Post-write diagnostics: existence and size
         try:
             exists_flag = await self.run_command(f"test -e {shlex.quote(spath)} && echo EXISTS || echo MISSING")
@@ -504,20 +506,6 @@ class DaytonaSandboxClient(BaseSandboxClient):
             logger.info(f"DaytonaSandboxClient.write_file: path={spath} exists={exists_flag.strip()} size_bytes={(size_info or '').strip()}")
         except Exception as e:
             logger.warning(f"DaytonaSandboxClient.write_file: failed to verify write for {spath}: {e}")
-
-    async def read_file(self, path: str) -> str:
-        if not self.sandbox:
-            raise RuntimeError("Sandbox not initialized")
-        spath = self._map_to_workspace(path)
-        try:
-            content = self.sandbox.fs.download_file(spath)
-            if hasattr(content, "__await__"):
-                content = await content
-            return content.decode("utf-8") if isinstance(content, (bytes, bytearray)) else str(content)
-        except Exception:
-            # Fallback to shell cat when SDK file API is unavailable
-            out = await self.run_command(f"cat {shlex.quote(spath)} || true")
-            return out
 
     async def cleanup(self) -> None:
         if self.sandbox and self._daytona:
@@ -528,6 +516,7 @@ class DaytonaSandboxClient(BaseSandboxClient):
                 pass
         self.sandbox = None
         self._daytona = None
+        self._sandbox_conv_id = None
 
 
 def create_sandbox_client() -> BaseSandboxClient:

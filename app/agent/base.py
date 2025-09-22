@@ -488,7 +488,14 @@ class BaseAgent(BaseModel, ABC):
                     await asyncio.gather(*pending, return_exceptions=True)
                 finally:
                     self.pending_persist_tasks.clear()
-        await SANDBOX_CLIENT.cleanup()
+        # Only cleanup sandbox automatically if keep_alive is disabled
+        try:
+            if not config.sandbox.keep_alive:
+                await SANDBOX_CLIENT.cleanup()
+            else:
+                logger.info("Sandbox keep_alive enabled; skipping automatic cleanup at end of agent.run")
+        except Exception as e:
+            logger.warning(f"Sandbox cleanup step encountered error: {e}")
 
         return "\n".join(results) if results else "No steps executed"
 
